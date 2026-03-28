@@ -1,0 +1,22 @@
+version: "2"
+
+linters:
+  enable-all: true
+
+  settings:
+    errcheck:
+      check-type-assertions: true
+      check-blank: true
+    gocritic:
+      enabled-tags:
+        - diagnostic
+        - performance
+        - style
+
+  exclusions:
+    rules:
+      # Test files can be more relaxed
+      - path: _test\.go
+        linters:
+          - errcheck
+          - forcetypeassert
