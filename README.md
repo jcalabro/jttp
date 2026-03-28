@@ -1,6 +1,6 @@
 # jttp
 
-[![CI](https://github.com/jcalabro/jttp/actions/workflows/ci.yml/badge.svg)](https://github.com/jcalabro/jttp/actions/workflows/ci.yml)
+[![ci](https://github.com/jcalabro/jttp/actions/workflows/ci.yaml/badge.svg)](https://github.com/jcalabro/jttp/actions/workflows/ci.yaml)
 [![Go Reference](https://pkg.go.dev/badge/github.com/jcalabro/jttp.svg)](https://pkg.go.dev/github.com/jcalabro/jttp)
 
 A robust HTTP client for Go with good defaults and tunable behavior.
