@@ -1,5 +1,9 @@
 default: lint test
 
+# Installs the required local development tools
+install-tools:
+    go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.7.2
+
 # Run linter
 lint:
     golangci-lint run
