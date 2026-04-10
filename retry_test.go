@@ -125,15 +125,17 @@ func TestBackoffRetryAfterSeconds(t *testing.T) {
 
 func TestBackoffRetryAfterCapped(t *testing.T) {
 	rt := &retryTransport{
-		waitMin: 100 * time.Millisecond,
-		waitMax: 2 * time.Second,
+		waitMin:       100 * time.Millisecond,
+		waitMax:       2 * time.Second,
+		maxRetryAfter: 5 * time.Second,
 	}
 
+	// Server asks for 10 seconds — capped at maxRetryAfter (5s), not waitMax.
 	resp := &http.Response{
 		Header: http.Header{"Retry-After": []string{"10"}},
 	}
 
-	requireEqual(t, rt.backoff(0, resp), 2*time.Second)
+	requireEqual(t, rt.backoff(0, resp), 5*time.Second)
 }
 
 func TestBackoffRetryAfterHTTPDate(t *testing.T) {
@@ -195,6 +197,9 @@ func TestPrepareBodyGetBody(t *testing.T) {
 }
 
 func TestPrepareBodyReadSeeker(t *testing.T) {
+	// ReadSeeker bodies without GetBody are buffered into memory (not seeked),
+	// because the transport closes the body after each attempt, which would
+	// break seek-based rewinding for types like *os.File.
 	body := bytes.NewReader([]byte("seekable"))
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://example.com", http.NoBody)
 	req.Body = readSeekerCloser{body}
@@ -353,4 +358,53 @@ func TestBackoffMinGreaterThanMax(t *testing.T) {
 
 	d := rt.backoff(0, nil)
 	requireTrue(t, d >= rt.waitMin && d <= rt.waitMax)
+}
+
+func TestRetryAfterRespected(t *testing.T) {
+	rt := &retryTransport{
+		waitMin:       100 * time.Millisecond,
+		waitMax:       2 * time.Second,
+		maxRetryAfter: 30 * time.Second,
+	}
+
+	// Server asks for 10 seconds — respected because it's within maxRetryAfter.
+	// Note: this exceeds waitMax (2s), which is correct. Retry-After is a
+	// server-directed delay and is capped by maxRetryAfter, not waitMax.
+	resp := &http.Response{
+		Header: http.Header{"Retry-After": []string{"10"}},
+	}
+	requireEqual(t, rt.backoff(0, resp), 10*time.Second)
+}
+
+func TestRetryAfterFlooredAtWaitMin(t *testing.T) {
+	rt := &retryTransport{
+		waitMin:       5 * time.Second,
+		waitMax:       30 * time.Second,
+		maxRetryAfter: 1 * time.Minute,
+	}
+
+	// Server asks for 1 second, but waitMin is 5 seconds.
+	resp := &http.Response{
+		Header: http.Header{"Retry-After": []string{"1"}},
+	}
+	requireEqual(t, rt.backoff(0, resp), 5*time.Second)
+}
+
+func TestContentLengthAfterBodyBuffering(t *testing.T) {
+	r := &plainReader{data: []byte("hello world")}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, "http://example.com", http.NoBody)
+	req.Body = io.NopCloser(r)
+	req.GetBody = nil
+	req.ContentLength = -1 // unknown
+
+	_, err := prepareBody(req, 0)
+	requireNoErr(t, err)
+
+	requireEqual(t, req.ContentLength, int64(11)) // "hello world" = 11 bytes
+}
+
+func TestMaxRetryAfterNegativeClamped(t *testing.T) {
+	client := New(WithMaxRetryAfter(-1 * time.Second))
+	rt := client.Transport.(*retryTransport)
+	requireEqual(t, rt.maxRetryAfter, DefaultMaxRetryAfter)
 }

@@ -32,10 +32,10 @@ const (
 	DefaultMaxRedirects          = 5
 	DefaultMaxIdleConns          = 20
 	DefaultMaxIdleConnsPerHost   = 20
-	DefaultMaxConnsPerHost       = 0 // unlimited
+	DefaultMaxConnsPerHost       = 100
 	DefaultIdleConnTimeout       = 90 * time.Second
 	DefaultTLSHandshakeTimeout   = 5 * time.Second
-	DefaultResponseHeaderTimeout = 0 // use Client.Timeout instead
+	DefaultResponseHeaderTimeout = 10 * time.Second
 	DefaultDialTimeout           = 5 * time.Second
 	DefaultDialKeepAlive         = 30 * time.Second
 	DefaultMaxRetries            = 3
@@ -43,6 +43,7 @@ const (
 	DefaultRetryWaitMax          = 2 * time.Second
 	DefaultExpectContinueTimeout = 2 * time.Second
 	DefaultMaxRetryBodyBytes     = 4 << 20 // 4 MiB
+	DefaultMaxRetryAfter         = 1 * time.Minute
 )
 
 type config struct {
@@ -69,6 +70,7 @@ type config struct {
 	maxRetries           int
 	retryWaitMin         time.Duration
 	retryWaitMax         time.Duration
+	maxRetryAfter        time.Duration
 	maxRetryBodyBytes    int64
 	retryableStatusCodes map[int]struct{}
 	retryableMethods     map[string]struct{}
@@ -99,6 +101,7 @@ func defaults() *config {
 		maxRetries:            DefaultMaxRetries,
 		retryWaitMin:          DefaultRetryWaitMin,
 		retryWaitMax:          DefaultRetryWaitMax,
+		maxRetryAfter:         DefaultMaxRetryAfter,
 		maxRetryBodyBytes:     DefaultMaxRetryBodyBytes,
 		retryableStatusCodes: map[int]struct{}{
 			http.StatusTooManyRequests:    {},
@@ -119,18 +122,16 @@ type Option func(*config)
 
 // New creates a new *http.Client with good defaults.
 // All defaults can be overridden via Option values.
+// As with all http.Clients, be sure to use the returned
+// client across the lifetime of multiple requests.
 func New(opts ...Option) *http.Client {
 	cfg := defaults()
 	for _, opt := range opts {
 		opt(cfg)
 	}
 
-	if cfg.maxRetries < 0 {
-		cfg.maxRetries = 0
-	}
-	if cfg.maxRedirects < 0 {
-		cfg.maxRedirects = 0
-	}
+	cfg.maxRetries = max(cfg.maxRetries, 0)
+	cfg.maxRedirects = max(cfg.maxRedirects, 0)
 	if cfg.retryWaitMin <= 0 {
 		cfg.retryWaitMin = DefaultRetryWaitMin
 	}
@@ -140,6 +141,19 @@ func New(opts ...Option) *http.Client {
 	if cfg.retryWaitMin > cfg.retryWaitMax {
 		cfg.retryWaitMin, cfg.retryWaitMax = cfg.retryWaitMax, cfg.retryWaitMin
 	}
+	if cfg.maxRetryAfter <= 0 {
+		cfg.maxRetryAfter = DefaultMaxRetryAfter
+	}
+
+	// Clamp negative durations for transport-level settings.
+	// Zero is valid and means "no limit" for most of these.
+	cfg.timeout = max(cfg.timeout, 0)
+	cfg.dialTimeout = max(cfg.dialTimeout, 0)
+	cfg.dialKeepAlive = max(cfg.dialKeepAlive, 0)
+	cfg.idleConnTimeout = max(cfg.idleConnTimeout, 0)
+	cfg.tlsHandshakeTimeout = max(cfg.tlsHandshakeTimeout, 0)
+	cfg.responseHeaderTimeout = max(cfg.responseHeaderTimeout, 0)
+	cfg.expectContinueTimeout = max(cfg.expectContinueTimeout, 0)
 
 	var base http.RoundTripper
 	if cfg.transport != nil {
@@ -148,6 +162,8 @@ func New(opts ...Option) *http.Client {
 		tlsCfg := cfg.tlsConfig
 		if tlsCfg == nil {
 			tlsCfg = &tls.Config{}
+		} else {
+			tlsCfg = tlsCfg.Clone()
 		}
 		if tlsCfg.MinVersion < tls.VersionTLS12 {
 			tlsCfg.MinVersion = tls.VersionTLS12
@@ -177,6 +193,7 @@ func New(opts ...Option) *http.Client {
 		maxRetries:        cfg.maxRetries,
 		waitMin:           cfg.retryWaitMin,
 		waitMax:           cfg.retryWaitMax,
+		maxRetryAfter:     cfg.maxRetryAfter,
 		maxRetryBodyBytes: cfg.maxRetryBodyBytes,
 		retryableCodes:    cfg.retryableStatusCodes,
 		retryableMethods:  cfg.retryableMethods,
@@ -243,7 +260,7 @@ func WithMaxIdleConnsPerHost(n int) Option {
 }
 
 // WithMaxConnsPerHost sets the maximum total connections per host.
-// 0 means unlimited (the default).
+// 0 means unlimited. Default: 100.
 func WithMaxConnsPerHost(n int) Option {
 	return func(c *config) { c.maxConnsPerHost = n }
 }
@@ -261,7 +278,7 @@ func WithTLSHandshakeTimeout(d time.Duration) Option {
 }
 
 // WithResponseHeaderTimeout sets the maximum time to wait for response headers
-// after the request is fully written. 0 means no limit (the default).
+// after the request is fully written. 0 means no limit. Default: 10s.
 func WithResponseHeaderTimeout(d time.Duration) Option {
 	return func(c *config) { c.responseHeaderTimeout = d }
 }
@@ -278,9 +295,14 @@ func WithRetries(n int) Option {
 	return func(c *config) { c.maxRetries = n }
 }
 
+// WithNoRetries disables retry logic entirely.
+func WithNoRetries() Option {
+	return WithRetries(0)
+}
+
 // WithRetryWait sets the minimum and maximum wait times between retries.
 // Backoff is exponential with full jitter within these bounds.
-// Default: 1s min, 10s max.
+// Default: 250ms min, 2s max.
 func WithRetryWait(minWait, maxWait time.Duration) Option {
 	return func(c *config) {
 		c.retryWaitMin = minWait
@@ -334,6 +356,14 @@ func WithAdditionalRetryableMethods(methods ...string) Option {
 	}
 }
 
+// WithMaxRetryAfter sets the maximum duration that a server's Retry-After
+// header will be respected. If the server requests a longer delay, it will
+// be capped at this value. Retry-After values are also floored at the
+// minimum retry wait time (see WithRetryWait). Default: 1 minute.
+func WithMaxRetryAfter(d time.Duration) Option {
+	return func(c *config) { c.maxRetryAfter = d }
+}
+
 // WithMaxRetryBodyBytes sets the maximum request body size (in bytes) that will
 // be buffered into memory for retry support. Bodies larger than this limit cause
 // an error when retries are enabled and the body is not already seekable.
@@ -350,9 +380,11 @@ func WithCheckRetry(fn func(req *http.Request, resp *http.Response, err error) b
 	return func(c *config) { c.checkRetry = fn }
 }
 
-// WithRetryObserver registers a callback that is invoked each time a retry
-// decision is made. The attempt number is 0-indexed (0 = first attempt that
-// will be retried). This is useful for logging or metrics.
+// WithRetryObserver registers a callback that is invoked before each retry
+// attempt. The attempt number is 0-indexed (0 = first failed attempt that
+// will be retried). This is not called on the final exhausted attempt —
+// only when a retry will actually follow. This is useful for logging or
+// metrics.
 func WithRetryObserver(fn func(attempt int, req *http.Request, resp *http.Response, err error)) Option {
 	return func(c *config) { c.retryObserver = fn }
 }

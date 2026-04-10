@@ -21,6 +21,7 @@ type retryTransport struct {
 	maxRetries        int
 	waitMin           time.Duration
 	waitMax           time.Duration
+	maxRetryAfter     time.Duration
 	maxRetryBodyBytes int64
 	retryableCodes    map[int]struct{}
 	retryableMethods  map[string]struct{}
@@ -64,14 +65,14 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 			return resp, err
 		}
 
-		if t.retryObserver != nil {
-			t.retryObserver(attempt, req, resp, err)
-		}
-
 		// On the final attempt, don't drain the response — return it as-is
 		// so the caller can read the error response body.
 		if attempt == t.maxRetries {
 			return resp, err
+		}
+
+		if t.retryObserver != nil {
+			t.retryObserver(attempt, req, resp, err)
 		}
 
 		// Best-effort drain to return the connection to the pool.
@@ -81,7 +82,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 	}
 
 	// Unreachable: the loop always returns via shouldRetry or final-attempt check.
-	return nil, nil
+	panic("jttp: unreachable: retry loop did not return")
 }
 
 // CloseIdleConnections propagates to the underlying transport so that
@@ -146,6 +147,7 @@ func (t *retryTransport) backoff(attempt int, resp *http.Response) time.Duration
 }
 
 // parseRetryAfterHeader extracts a wait duration from the Retry-After header.
+// The returned duration is floored at waitMin and capped at maxRetryAfter.
 func (t *retryTransport) parseRetryAfterHeader(resp *http.Response) (time.Duration, bool) {
 	ra := resp.Header.Get("Retry-After")
 	if ra == "" {
@@ -155,7 +157,13 @@ func (t *retryTransport) parseRetryAfterHeader(resp *http.Response) (time.Durati
 	if d <= 0 {
 		return 0, false
 	}
-	return min(d, t.waitMax), true
+	if t.waitMin > 0 {
+		d = max(d, t.waitMin)
+	}
+	if t.maxRetryAfter > 0 {
+		d = min(d, t.maxRetryAfter)
+	}
+	return d, true
 }
 
 func isRetryableError(err error) bool {
@@ -228,19 +236,9 @@ func prepareBody(req *http.Request, maxBytes int64) (func() (io.ReadCloser, erro
 		return req.GetBody, nil
 	}
 
-	// If Body implements io.ReadSeeker, wrap it.
-	if seeker, ok := req.Body.(io.ReadSeeker); ok {
-		getBody := func() (io.ReadCloser, error) {
-			if _, err := seeker.Seek(0, io.SeekStart); err != nil {
-				return nil, err
-			}
-			return req.Body, nil
-		}
-		req.GetBody = getBody
-		return getBody, nil
-	}
-
 	// Last resort: read the body into memory with an optional size limit.
+	// This handles io.ReadSeeker bodies safely — relying on Seek after the
+	// transport closes the body (e.g., an *os.File) would fail on retry.
 	var reader io.Reader = req.Body
 	if maxBytes > 0 {
 		reader = io.LimitReader(reader, maxBytes+1)
@@ -265,6 +263,7 @@ func prepareBody(req *http.Request, maxBytes int64) (func() (io.ReadCloser, erro
 		return io.NopCloser(bytes.NewReader(body)), nil
 	}
 
+	req.ContentLength = int64(len(body))
 	req.GetBody = getBody
 	var bodyErr error
 	req.Body, bodyErr = getBody()
@@ -302,7 +301,11 @@ func (t *retryTransport) waitForRetry(
 	return nil
 }
 
-// drainAndClose drains a small amount of the response body (to allow
+// maxDrainBytes limits how many bytes are read from a response body when
+// draining it for connection reuse during retries.
+const maxDrainBytes = 1 << 16 // 64 KiB
+
+// drainAndClose drains the response body up to maxDrainBytes (to allow
 // connection reuse) and closes it. Errors are intentionally ignored.
 func drainAndClose(resp *http.Response) {
 	if resp == nil || resp.Body == nil {
@@ -310,7 +313,7 @@ func drainAndClose(resp *http.Response) {
 	}
 
 	//nolint // best-effort drain for connection reuse
-	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrainBytes))
 
 	//nolint // best-effort close
 	resp.Body.Close()

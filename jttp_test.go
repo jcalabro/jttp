@@ -1,6 +1,7 @@
 package jttp
 
 import (
+	"bytes"
 	"context"
 	"crypto/tls"
 	"fmt"
@@ -26,6 +27,7 @@ func TestDefaults(t *testing.T) {
 	requireEqual(t, rt.maxRetries, DefaultMaxRetries)
 	requireEqual(t, rt.waitMin, DefaultRetryWaitMin)
 	requireEqual(t, rt.waitMax, DefaultRetryWaitMax)
+	requireEqual(t, rt.maxRetryAfter, DefaultMaxRetryAfter)
 	requireEqual(t, rt.userAgent, "")
 }
 
@@ -132,8 +134,9 @@ func TestRetryOn429WithRetryAfter(t *testing.T) {
 
 	client := New(
 		WithRetries(2),
-		// waitMax caps the Retry-After to 50ms.
 		WithRetryWait(10*time.Millisecond, 50*time.Millisecond),
+		// MaxRetryAfter caps the server's Retry-After (10s) to 50ms.
+		WithMaxRetryAfter(50*time.Millisecond),
 	)
 
 	start := time.Now()
@@ -311,9 +314,12 @@ func TestNoRedirects(t *testing.T) {
 }
 
 func TestUserAgentSet(t *testing.T) {
+	var mu sync.Mutex
 	var gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotUA = r.Header.Get("User-Agent")
+		mu.Unlock()
 	}))
 	defer srv.Close()
 
@@ -323,13 +329,19 @@ func TestUserAgentSet(t *testing.T) {
 	requireNoErr(t, err)
 	resp.Body.Close()
 
-	requireEqual(t, gotUA, "myapp/2.0")
+	mu.Lock()
+	ua := gotUA
+	mu.Unlock()
+	requireEqual(t, ua, "myapp/2.0")
 }
 
 func TestUserAgentNotOverridden(t *testing.T) {
+	var mu sync.Mutex
 	var gotUA string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
 		gotUA = r.Header.Get("User-Agent")
+		mu.Unlock()
 	}))
 	defer srv.Close()
 
@@ -340,7 +352,10 @@ func TestUserAgentNotOverridden(t *testing.T) {
 	requireNoErr(t, err)
 	resp.Body.Close()
 
-	requireEqual(t, gotUA, "custom/1.0")
+	mu.Lock()
+	ua := gotUA
+	mu.Unlock()
+	requireEqual(t, ua, "custom/1.0")
 }
 
 func TestRetryWithBody(t *testing.T) {
@@ -705,4 +720,245 @@ func TestRetryBodyTooLargeForRetry(t *testing.T) {
 		resp.Body.Close()
 	}
 	requireErrContains(t, err, "exceeds retry buffer limit")
+}
+
+func TestTLSConfigNotMutated(t *testing.T) {
+	custom := &tls.Config{
+		MinVersion: tls.VersionTLS10,
+		ServerName: "example.com",
+	}
+	New(WithTLSConfig(custom), WithRetries(0))
+
+	// The caller's original config must not be mutated.
+	requireEqual(t, custom.MinVersion, uint16(tls.VersionTLS10))
+	requireEqual(t, custom.ServerName, "example.com")
+}
+
+func TestDefaultResponseHeaderTimeout(t *testing.T) {
+	client := New(WithRetries(0))
+	rt := client.Transport.(*retryTransport)
+	tr := rt.next.(*http.Transport)
+	requireEqual(t, tr.ResponseHeaderTimeout, DefaultResponseHeaderTimeout)
+	requireTrue(t, tr.ResponseHeaderTimeout > 0)
+}
+
+func TestDefaultMaxConnsPerHost(t *testing.T) {
+	client := New(WithRetries(0))
+	rt := client.Transport.(*retryTransport)
+	tr := rt.next.(*http.Transport)
+	requireEqual(t, tr.MaxConnsPerHost, DefaultMaxConnsPerHost)
+	requireTrue(t, tr.MaxConnsPerHost > 0)
+}
+
+func TestWithNoRetries(t *testing.T) {
+	client := New(WithNoRetries())
+	rt := client.Transport.(*retryTransport)
+	requireEqual(t, rt.maxRetries, 0)
+}
+
+func TestWithMaxRetryAfter(t *testing.T) {
+	client := New(WithMaxRetryAfter(30 * time.Second))
+	rt := client.Transport.(*retryTransport)
+	requireEqual(t, rt.maxRetryAfter, 30*time.Second)
+}
+
+func TestNegativeDurationsClamped(t *testing.T) {
+	client := New(
+		WithTimeout(-1*time.Second),
+		WithDialTimeout(-1*time.Second),
+		WithDialKeepAlive(-1*time.Second),
+		WithIdleConnTimeout(-1*time.Second),
+		WithTLSHandshakeTimeout(-1*time.Second),
+		WithResponseHeaderTimeout(-1*time.Second),
+		WithExpectContinueTimeout(-1*time.Second),
+		WithRetries(0),
+	)
+
+	requireEqual(t, client.Timeout, time.Duration(0))
+
+	rt := client.Transport.(*retryTransport)
+	tr := rt.next.(*http.Transport)
+	requireEqual(t, tr.TLSHandshakeTimeout, time.Duration(0))
+	requireEqual(t, tr.ResponseHeaderTimeout, time.Duration(0))
+	requireEqual(t, tr.ExpectContinueTimeout, time.Duration(0))
+	requireEqual(t, tr.IdleConnTimeout, time.Duration(0))
+}
+
+func TestRetryableStatusCodesEmpty(t *testing.T) {
+	var count atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	// Empty status codes disables status-code-based retries.
+	client := New(
+		WithRetryableStatusCodes(),
+		WithRetries(3),
+		WithRetryWait(10*time.Millisecond, 50*time.Millisecond),
+	)
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
+	resp, err := client.Do(req)
+	requireNoErr(t, err)
+	resp.Body.Close()
+
+	requireEqual(t, resp.StatusCode, http.StatusServiceUnavailable)
+	requireEqual(t, count.Load(), int32(1)) // No retries
+}
+
+func TestCloseIdleConnectionsNonCloser(t *testing.T) {
+	custom := &fakeRoundTripper{
+		fn: func(_ *http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Header:     make(http.Header),
+			}, nil
+		},
+	}
+	client := New(WithTransport(custom), WithRetries(0))
+	// Should not panic even though fakeRoundTripper doesn't implement CloseIdleConnections.
+	client.CloseIdleConnections()
+}
+
+func TestRetryObserverNotCalledOnFinalExhaustedAttempt(t *testing.T) {
+	var observed []int
+	var mu sync.Mutex
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+
+	client := New(
+		WithRetries(2),
+		WithRetryWait(10*time.Millisecond, 50*time.Millisecond),
+		WithRetryObserver(func(attempt int, _ *http.Request, _ *http.Response, _ error) {
+			mu.Lock()
+			observed = append(observed, attempt)
+			mu.Unlock()
+		}),
+	)
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
+	resp, err := client.Do(req)
+	requireNoErr(t, err)
+	resp.Body.Close()
+
+	mu.Lock()
+	defer mu.Unlock()
+	// Observer should be called for attempts 0 and 1 only (which will be retried).
+	// The final exhausted attempt (2) should NOT trigger the observer.
+	requireEqual(t, len(observed), 2)
+	requireEqual(t, observed[0], 0)
+	requireEqual(t, observed[1], 1)
+}
+
+func TestRetryWithReadSeekerBody(t *testing.T) {
+	var count atomic.Int32
+	var mu sync.Mutex
+	var lastBody string
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		lastBody = string(body)
+		mu.Unlock()
+		n := count.Add(1)
+		if n <= 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	client := New(
+		WithRetries(3),
+		WithRetryWait(10*time.Millisecond, 50*time.Millisecond),
+		WithRetryableMethods("GET", "POST"),
+	)
+
+	// Use a ReadSeeker body with no GetBody set — exercises the buffer fallback
+	// path that replaced the old (broken) ReadSeeker-seek path.
+	body := bytes.NewReader([]byte("seekable-data"))
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, http.NoBody)
+	req.Body = readSeekerCloser{body}
+	req.GetBody = nil
+
+	resp, err := client.Do(req)
+	requireNoErr(t, err)
+	defer resp.Body.Close()
+
+	requireEqual(t, resp.StatusCode, http.StatusOK)
+
+	mu.Lock()
+	got := lastBody
+	mu.Unlock()
+	requireEqual(t, got, "seekable-data")
+}
+
+func TestRetryWithCustomTransport(t *testing.T) {
+	var attempts atomic.Int32
+	transport := &fakeRoundTripper{
+		fn: func(_ *http.Request) (*http.Response, error) {
+			n := attempts.Add(1)
+			if n <= 2 {
+				return &http.Response{
+					StatusCode: http.StatusServiceUnavailable,
+					Body:       io.NopCloser(strings.NewReader("unavailable")),
+					Header:     make(http.Header),
+				}, nil
+			}
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Body:       io.NopCloser(strings.NewReader("ok")),
+				Header:     make(http.Header),
+			}, nil
+		},
+	}
+
+	client := New(
+		WithTransport(transport),
+		WithRetries(3),
+		WithRetryWait(10*time.Millisecond, 50*time.Millisecond),
+	)
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://fake.test", http.NoBody)
+	resp, err := client.Do(req)
+	requireNoErr(t, err)
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	requireEqual(t, string(body), "ok")
+	requireEqual(t, attempts.Load(), int32(3))
+}
+
+func TestRetryAdditionalStatusCodesOrdering(t *testing.T) {
+	// WithAdditionalRetryableStatusCodes before WithRetryableStatusCodes:
+	// the additional code is lost because the latter replaces the map.
+	client := New(
+		WithAdditionalRetryableStatusCodes(500),
+		WithRetryableStatusCodes(429),
+	)
+	rt := client.Transport.(*retryTransport)
+
+	_, has429 := rt.retryableCodes[429]
+	requireTrue(t, has429)
+	_, has500 := rt.retryableCodes[500]
+	requireFalse(t, has500) // 500 was wiped by the subsequent replace
+
+	// Reverse order: WithRetryableStatusCodes first, then additional.
+	client2 := New(
+		WithRetryableStatusCodes(429),
+		WithAdditionalRetryableStatusCodes(500),
+	)
+	rt2 := client2.Transport.(*retryTransport)
+
+	_, has429 = rt2.retryableCodes[429]
+	requireTrue(t, has429)
+	_, has500 = rt2.retryableCodes[500]
+	requireTrue(t, has500)
 }
