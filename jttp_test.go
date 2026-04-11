@@ -962,3 +962,116 @@ func TestRetryAdditionalStatusCodesOrdering(t *testing.T) {
 	_, has500 = rt2.retryableCodes[500]
 	requireTrue(t, has500)
 }
+
+func TestWithDialContext(t *testing.T) {
+	var dialCalled atomic.Bool
+	customDial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialCalled.Store(true)
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, address)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	client := New(WithDialContext(customDial), WithNoRetries())
+	resp, err := client.Get(srv.URL)
+	requireNoErr(t, err)
+	resp.Body.Close()
+	requireTrue(t, dialCalled.Load())
+}
+
+func TestWithResolver(t *testing.T) {
+	// Verify the resolver is set on the transport's dialer by checking that
+	// the transport is constructed without error and the resolver field is
+	// propagated. We can't easily inspect the dialer inside the transport,
+	// so we verify it works end-to-end with a real server.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	resolver := &net.Resolver{PreferGo: true}
+	client := New(WithResolver(resolver), WithNoRetries())
+	resp, err := client.Get(srv.URL)
+	requireNoErr(t, err)
+	resp.Body.Close()
+	requireEqual(t, resp.StatusCode, 200)
+}
+
+func TestWithDialContextOverridesResolver(t *testing.T) {
+	// When both WithDialContext and WithResolver are set, the custom
+	// DialContext takes precedence.
+	var customDialCalled atomic.Bool
+	customDial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		customDialCalled.Store(true)
+		return (&net.Dialer{Timeout: 5 * time.Second}).DialContext(ctx, network, address)
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	resolver := &net.Resolver{PreferGo: true}
+	client := New(WithDialContext(customDial), WithResolver(resolver), WithNoRetries())
+	resp, err := client.Get(srv.URL)
+	requireNoErr(t, err)
+	resp.Body.Close()
+	requireTrue(t, customDialCalled.Load())
+}
+
+func TestWithProxy(t *testing.T) {
+	client := New(WithProxy(http.ProxyFromEnvironment), WithNoRetries())
+	rt := client.Transport.(*retryTransport)
+	tr := rt.next.(*http.Transport)
+	// Verify the transport was built (not nil) — we can't compare function
+	// pointers directly, but we can verify the transport exists.
+	requireTrue(t, tr != nil)
+}
+
+func TestWithNoProxy(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	client := New(WithNoProxy(), WithNoRetries())
+	resp, err := client.Get(srv.URL)
+	requireNoErr(t, err)
+	resp.Body.Close()
+	requireEqual(t, resp.StatusCode, 200)
+}
+
+func TestWithMaxResponseHeaderBytes(t *testing.T) {
+	client := New(WithMaxResponseHeaderBytes(1<<20), WithNoRetries())
+	rt := client.Transport.(*retryTransport)
+	tr := rt.next.(*http.Transport)
+	requireEqual(t, tr.MaxResponseHeaderBytes, int64(1<<20))
+}
+
+func TestDialContextIgnoredWithTransport(t *testing.T) {
+	// When WithTransport is used, WithDialContext should be ignored — the
+	// custom transport is used as-is.
+	var dialCalled atomic.Bool
+	customDial := func(ctx context.Context, network, address string) (net.Conn, error) {
+		dialCalled.Store(true)
+		return nil, fmt.Errorf("should not be called")
+	}
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	client := New(
+		WithDialContext(customDial),
+		WithTransport(http.DefaultTransport),
+		WithNoRetries(),
+	)
+	resp, err := client.Get(srv.URL)
+	requireNoErr(t, err)
+	resp.Body.Close()
+	requireFalse(t, dialCalled.Load())
+}

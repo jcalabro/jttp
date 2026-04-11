@@ -19,10 +19,12 @@
 package jttp
 
 import (
+	"context"
 	"crypto/tls"
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"time"
 )
 
@@ -53,18 +55,22 @@ type config struct {
 	userAgent    string
 
 	// Transport-level
-	maxIdleConns          int
-	maxIdleConnsPerHost   int
-	maxConnsPerHost       int
-	idleConnTimeout       time.Duration
-	tlsHandshakeTimeout   time.Duration
-	responseHeaderTimeout time.Duration
-	dialTimeout           time.Duration
-	dialKeepAlive         time.Duration
-	expectContinueTimeout time.Duration
-	disableKeepAlives     bool
-	disableCompression    bool
-	forceHTTP2            bool
+	maxIdleConns           int
+	maxIdleConnsPerHost    int
+	maxConnsPerHost        int
+	idleConnTimeout        time.Duration
+	tlsHandshakeTimeout    time.Duration
+	responseHeaderTimeout  time.Duration
+	maxResponseHeaderBytes int64
+	dialTimeout            time.Duration
+	dialKeepAlive          time.Duration
+	expectContinueTimeout  time.Duration
+	disableKeepAlives      bool
+	disableCompression     bool
+	forceHTTP2             bool
+	dialContext            func(ctx context.Context, network, address string) (net.Conn, error)
+	resolver               *net.Resolver
+	proxy                  func(*http.Request) (*url.URL, error)
 
 	// Retries
 	maxRetries           int
@@ -168,23 +174,40 @@ func New(opts ...Option) *http.Client {
 		if tlsCfg.MinVersion < tls.VersionTLS12 {
 			tlsCfg.MinVersion = tls.VersionTLS12
 		}
-		base = &http.Transport{
-			Proxy: http.ProxyFromEnvironment,
-			DialContext: (&net.Dialer{
+
+		// Build the dial function. WithDialContext takes full precedence;
+		// otherwise the default dialer is used with an optional custom
+		// resolver (WithResolver).
+		dialCtx := cfg.dialContext
+		if dialCtx == nil {
+			dialer := &net.Dialer{
 				Timeout:   cfg.dialTimeout,
 				KeepAlive: cfg.dialKeepAlive,
-			}).DialContext,
-			MaxIdleConns:          cfg.maxIdleConns,
-			MaxIdleConnsPerHost:   cfg.maxIdleConnsPerHost,
-			MaxConnsPerHost:       cfg.maxConnsPerHost,
-			IdleConnTimeout:       cfg.idleConnTimeout,
-			TLSHandshakeTimeout:   cfg.tlsHandshakeTimeout,
-			ResponseHeaderTimeout: cfg.responseHeaderTimeout,
-			ExpectContinueTimeout: cfg.expectContinueTimeout,
-			ForceAttemptHTTP2:     cfg.forceHTTP2,
-			DisableKeepAlives:     cfg.disableKeepAlives,
-			DisableCompression:    cfg.disableCompression,
-			TLSClientConfig:       tlsCfg,
+				Resolver:  cfg.resolver,
+			}
+			dialCtx = dialer.DialContext
+		}
+
+		proxyFn := http.ProxyFromEnvironment
+		if cfg.proxy != nil {
+			proxyFn = cfg.proxy
+		}
+
+		base = &http.Transport{
+			Proxy:                  proxyFn,
+			DialContext:            dialCtx,
+			MaxIdleConns:           cfg.maxIdleConns,
+			MaxIdleConnsPerHost:    cfg.maxIdleConnsPerHost,
+			MaxConnsPerHost:        cfg.maxConnsPerHost,
+			IdleConnTimeout:        cfg.idleConnTimeout,
+			TLSHandshakeTimeout:    cfg.tlsHandshakeTimeout,
+			ResponseHeaderTimeout:  cfg.responseHeaderTimeout,
+			MaxResponseHeaderBytes: cfg.maxResponseHeaderBytes,
+			ExpectContinueTimeout:  cfg.expectContinueTimeout,
+			ForceAttemptHTTP2:      cfg.forceHTTP2,
+			DisableKeepAlives:      cfg.disableKeepAlives,
+			DisableCompression:     cfg.disableCompression,
+			TLSClientConfig:        tlsCfg,
 		}
 	}
 
@@ -433,4 +456,49 @@ func WithExpectContinueTimeout(d time.Duration) Option {
 // Default: 30s.
 func WithDialKeepAlive(d time.Duration) Option {
 	return func(c *config) { c.dialKeepAlive = d }
+}
+
+// WithDialContext provides a custom function for establishing TCP connections.
+// When set, WithDialTimeout, WithDialKeepAlive, and WithResolver are ignored
+// since they configure the default dialer that this replaces.
+// This option is ignored when WithTransport is used.
+func WithDialContext(fn func(ctx context.Context, network, address string) (net.Conn, error)) Option {
+	return func(c *config) { c.dialContext = fn }
+}
+
+// WithResolver sets a custom DNS resolver on the default dialer.
+// This is useful for directing DNS queries to a specific server (e.g., 1.1.1.1)
+// without replacing the entire dial function. Example:
+//
+//	jttp.New(jttp.WithResolver(&net.Resolver{
+//	    PreferGo: true,
+//	    Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+//	        return (&net.Dialer{}).DialContext(ctx, "udp", "1.1.1.1:53")
+//	    },
+//	}))
+//
+// This option is ignored when WithDialContext or WithTransport is used.
+func WithResolver(r *net.Resolver) Option {
+	return func(c *config) { c.resolver = r }
+}
+
+// WithProxy sets a custom proxy function for the transport.
+// The default is http.ProxyFromEnvironment. Use WithNoProxy to disable
+// proxy support entirely.
+// This option is ignored when WithTransport is used.
+func WithProxy(fn func(*http.Request) (*url.URL, error)) Option {
+	return func(c *config) { c.proxy = fn }
+}
+
+// WithNoProxy disables proxy support, making all connections direct.
+// This option is ignored when WithTransport is used.
+func WithNoProxy() Option {
+	return WithProxy(func(*http.Request) (*url.URL, error) { return nil, nil })
+}
+
+// WithMaxResponseHeaderBytes sets the maximum number of response bytes that
+// the transport will read looking for the header. 0 means no limit.
+// This option is ignored when WithTransport is used.
+func WithMaxResponseHeaderBytes(n int64) Option {
+	return func(c *config) { c.maxResponseHeaderBytes = n }
 }
