@@ -26,6 +26,8 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // Default configuration values. All can be overridden via Option values.
@@ -48,6 +50,11 @@ const (
 	DefaultMaxRetryAfter         = 1 * time.Minute
 )
 
+// defaultTLSSessionCacheCapacity is the LRU size used when the caller hasn't
+// provided a ClientSessionCache. 32 covers session reuse across a handful of
+// distinct hosts without unbounded memory growth.
+const defaultTLSSessionCacheCapacity = 32
+
 type config struct {
 	// Client-level
 	timeout      time.Duration
@@ -68,6 +75,8 @@ type config struct {
 	disableKeepAlives      bool
 	disableCompression     bool
 	forceHTTP2             bool
+	http2ReadIdleTimeout   time.Duration
+	http2PingTimeout       time.Duration
 	dialContext            func(ctx context.Context, network, address string) (net.Conn, error)
 	resolver               *net.Resolver
 	proxy                  func(*http.Request) (*url.URL, error)
@@ -104,12 +113,16 @@ func defaults() *config {
 		dialKeepAlive:         DefaultDialKeepAlive,
 		expectContinueTimeout: DefaultExpectContinueTimeout,
 		forceHTTP2:            true,
+		http2ReadIdleTimeout:  DefaultHTTP2ReadIdleTimeout,
+		http2PingTimeout:      DefaultHTTP2PingTimeout,
 		maxRetries:            DefaultMaxRetries,
 		retryWaitMin:          DefaultRetryWaitMin,
 		retryWaitMax:          DefaultRetryWaitMax,
 		maxRetryAfter:         DefaultMaxRetryAfter,
 		maxRetryBodyBytes:     DefaultMaxRetryBodyBytes,
 		retryableStatusCodes: map[int]struct{}{
+			http.StatusRequestTimeout:     {},
+			http.StatusTooEarly:           {},
 			http.StatusTooManyRequests:    {},
 			http.StatusBadGateway:         {},
 			http.StatusServiceUnavailable: {},
@@ -161,7 +174,10 @@ func New(opts ...Option) *http.Client {
 	cfg.responseHeaderTimeout = max(cfg.responseHeaderTimeout, 0)
 	cfg.expectContinueTimeout = max(cfg.expectContinueTimeout, 0)
 
-	var base http.RoundTripper
+	var (
+		base http.RoundTripper
+		h2   *http2.Transport
+	)
 	if cfg.transport != nil {
 		base = cfg.transport
 	} else {
@@ -173,6 +189,12 @@ func New(opts ...Option) *http.Client {
 		}
 		if tlsCfg.MinVersion < tls.VersionTLS12 {
 			tlsCfg.MinVersion = tls.VersionTLS12
+		}
+		// Enable TLS 1.2 ticket resumption and TLS 1.3 PSK resumption by
+		// default. The Go stdlib does not install a default cache, so
+		// without this every connection performs a full handshake.
+		if tlsCfg.ClientSessionCache == nil {
+			tlsCfg.ClientSessionCache = tls.NewLRUClientSessionCache(defaultTLSSessionCacheCapacity)
 		}
 
 		// Build the dial function. WithDialContext takes full precedence;
@@ -193,7 +215,7 @@ func New(opts ...Option) *http.Client {
 			proxyFn = cfg.proxy
 		}
 
-		base = &http.Transport{
+		tr := &http.Transport{
 			Proxy:                  proxyFn,
 			DialContext:            dialCtx,
 			MaxIdleConns:           cfg.maxIdleConns,
@@ -209,6 +231,23 @@ func New(opts ...Option) *http.Client {
 			DisableCompression:     cfg.disableCompression,
 			TLSClientConfig:        tlsCfg,
 		}
+		if cfg.forceHTTP2 {
+			// ConfigureTransports replaces ForceAttemptHTTP2's implicit
+			// wiring with an explicit *http2.Transport whose ReadIdleTimeout
+			// / PingTimeout we can set. Without these, dead half-open H/2
+			// connections sit in the pool until the next use.
+			//
+			// The only documented failure mode is "t1 already has HTTP/2
+			// configured", which cannot happen for a transport we just
+			// constructed. A non-nil error here means the contract changed —
+			// crash rather than silently falling back to unhealthy H/2.
+			var err error
+			h2, err = configureHTTP2(tr, cfg.http2ReadIdleTimeout, cfg.http2PingTimeout)
+			if err != nil {
+				panic(fmt.Sprintf("jttp: unexpected error configuring HTTP/2: %v", err))
+			}
+		}
+		base = tr
 	}
 
 	rt := &retryTransport{
@@ -223,6 +262,7 @@ func New(opts ...Option) *http.Client {
 		checkRetry:        cfg.checkRetry,
 		retryObserver:     cfg.retryObserver,
 		userAgent:         cfg.userAgent,
+		http2Transport:    h2,
 	}
 
 	client := &http.Client{
@@ -238,7 +278,7 @@ func New(opts ...Option) *http.Client {
 		maxRedirects := cfg.maxRedirects
 		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
 			if len(via) >= maxRedirects {
-				return fmt.Errorf("stopped after %d redirects", maxRedirects)
+				return fmt.Errorf("%w: stopped after %d redirects", ErrTooManyRedirects, maxRedirects)
 			}
 			return nil
 		}
@@ -334,7 +374,7 @@ func WithRetryWait(minWait, maxWait time.Duration) Option {
 }
 
 // WithRetryableStatusCodes replaces the default retryable status codes.
-// Default: 429, 502, 503, 504.
+// Default: 408, 425, 429, 502, 503, 504.
 func WithRetryableStatusCodes(codes ...int) Option {
 	return func(c *config) {
 		c.retryableStatusCodes = make(map[int]struct{}, len(codes))
@@ -379,10 +419,12 @@ func WithAdditionalRetryableMethods(methods ...string) Option {
 	}
 }
 
-// WithMaxRetryAfter sets the maximum duration that a server's Retry-After
-// header will be respected. If the server requests a longer delay, it will
-// be capped at this value. Retry-After values are also floored at the
-// minimum retry wait time (see WithRetryWait). Default: 1 minute.
+// WithMaxRetryAfter sets the maximum duration that a server-directed wait
+// hint will be respected. If the server requests a longer delay, it will
+// be capped at this value. Applies to Retry-After, RateLimit-Reset (RFC
+// 9745 draft), and X-RateLimit-Reset (vendor-specific). Values are also
+// floored at the minimum retry wait time (see WithRetryWait).
+// Default: 1 minute.
 func WithMaxRetryAfter(d time.Duration) Option {
 	return func(c *config) { c.maxRetryAfter = d }
 }
@@ -443,6 +485,22 @@ func WithDisableCompression() Option {
 // config is set. Default: true.
 func WithForceHTTP2(force bool) Option {
 	return func(c *config) { c.forceHTTP2 = force }
+}
+
+// WithHTTP2ReadIdleTimeout sets the duration after which an HTTP/2 health-check
+// PING is sent when no frame has been received on a connection. This detects
+// silently-dropped connections (e.g., by a load balancer) that would otherwise
+// sit in the idle pool forever. Set to 0 to disable health checks.
+// Default: 30s. Has no effect when WithForceHTTP2(false) or WithTransport is used.
+func WithHTTP2ReadIdleTimeout(d time.Duration) Option {
+	return func(c *config) { c.http2ReadIdleTimeout = d }
+}
+
+// WithHTTP2PingTimeout sets how long to wait for a response to an HTTP/2
+// health-check PING before tearing the connection down.
+// Default: 15s. Has no effect when WithForceHTTP2(false) or WithTransport is used.
+func WithHTTP2PingTimeout(d time.Duration) Option {
+	return func(c *config) { c.http2PingTimeout = d }
 }
 
 // WithExpectContinueTimeout sets the maximum time to wait for a server's

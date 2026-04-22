@@ -630,6 +630,43 @@ func TestWithAdditionalRetryableStatusCodes(t *testing.T) {
 	}
 }
 
+func TestDefaultRetryableStatusCodesInclude408And425(t *testing.T) {
+	client := New()
+	rt := client.Transport.(*retryTransport)
+
+	for _, code := range []int{408, 425, 429, 502, 503, 504} {
+		_, ok := rt.retryableCodes[code]
+		if !ok {
+			t.Fatalf("expected %d to be in default retryable codes, was not", code)
+		}
+	}
+}
+
+func TestRetryOn408RequestTimeout(t *testing.T) {
+	var count atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := count.Add(1)
+		if n <= 1 {
+			w.WriteHeader(http.StatusRequestTimeout)
+			return
+		}
+		fmt.Fprint(w, "ok")
+	}))
+	defer srv.Close()
+
+	client := New(
+		WithRetries(2),
+		WithRetryWait(1*time.Millisecond, 5*time.Millisecond),
+	)
+
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
+	resp, err := client.Do(req)
+	requireNoErr(t, err)
+	defer resp.Body.Close()
+	requireEqual(t, resp.StatusCode, http.StatusOK)
+	requireEqual(t, count.Load(), int32(2))
+}
+
 func TestWithAdditionalRetryableMethods(t *testing.T) {
 	client := New(WithAdditionalRetryableMethods("POST", "PUT"))
 	rt := client.Transport.(*retryTransport)

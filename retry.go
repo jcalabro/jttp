@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"syscall"
 	"time"
+
+	"golang.org/x/net/http2"
 )
 
 // retryTransport wraps an http.RoundTripper with retry logic, exponential
@@ -28,6 +30,11 @@ type retryTransport struct {
 	checkRetry        func(req *http.Request, resp *http.Response, err error) bool
 	retryObserver     func(attempt int, req *http.Request, resp *http.Response, err error)
 	userAgent         string
+	// http2Transport is non-nil when we built the underlying *http.Transport
+	// ourselves and successfully configured HTTP/2. Exposed for test
+	// introspection and for callers who want to adjust H/2 settings at
+	// runtime.
+	http2Transport *http2.Transport
 }
 
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -40,49 +47,51 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		req.Header.Set("User-Agent", t.userAgent)
 	}
 
+	// Only buffer the body if this request could actually be retried.
+	// The method filter in shouldRetry always applies (even with a custom
+	// checkRetry), so a non-retryable method means no retries will ever
+	// fire — buffering is wasted work and can spuriously reject large bodies.
 	var getBody func() (io.ReadCloser, error)
 	if t.maxRetries > 0 {
-		var err error
-		getBody, err = prepareBody(req, t.maxRetryBodyBytes)
-		if err != nil {
-			return nil, err
+		if _, retryableMethod := t.retryableMethods[req.Method]; retryableMethod {
+			var err error
+			getBody, err = prepareBody(req, t.maxRetryBodyBytes)
+			if err != nil {
+				return nil, err
+			}
 		}
 	}
 
 	ctx := req.Context()
-	var lastResp *http.Response
+	var (
+		resp *http.Response
+		err  error
+	)
 
-	for attempt := range t.maxRetries + 1 {
+	for attempt := 0; ; attempt++ {
 		if attempt > 0 {
-			if err := t.waitForRetry(ctx, attempt-1, lastResp, getBody, req); err != nil {
-				return lastResp, err
+			// Drain the previous response so the connection can return to
+			// the pool while we back off. Retry-After (a header) is still
+			// readable after draining the body.
+			drainAndClose(resp)
+			if werr := t.waitForRetry(ctx, attempt-1, resp, getBody, req); werr != nil {
+				return resp, werr
 			}
 		}
 
-		resp, err := t.next.RoundTrip(req)
+		resp, err = t.next.RoundTrip(req)
 
-		if !t.shouldRetry(req, resp, err) {
-			return resp, err
-		}
-
-		// On the final attempt, don't drain the response — return it as-is
-		// so the caller can read the error response body.
-		if attempt == t.maxRetries {
+		// Stop if we shouldn't retry, or if we've used our last attempt.
+		// On the final attempt we return the response undrained so the
+		// caller can read the error body.
+		if !t.shouldRetry(req, resp, err) || attempt == t.maxRetries {
 			return resp, err
 		}
 
 		if t.retryObserver != nil {
 			t.retryObserver(attempt, req, resp, err)
 		}
-
-		// Best-effort drain to return the connection to the pool.
-		drainAndClose(resp)
-
-		lastResp = resp
 	}
-
-	// Unreachable: the loop always returns via shouldRetry or final-attempt check.
-	panic("jttp: unreachable: retry loop did not return")
 }
 
 // CloseIdleConnections propagates to the underlying transport so that
@@ -123,9 +132,11 @@ func (t *retryTransport) shouldRetry(req *http.Request, resp *http.Response, err
 const maxBackoffShift = 62
 
 func (t *retryTransport) backoff(attempt int, resp *http.Response) time.Duration {
-	// Respect Retry-After header if present.
+	// Respect server-directed wait hints in priority order:
+	// Retry-After (RFC 7231), RateLimit-Reset (RFC 9745 draft), then
+	// X-RateLimit-Reset (widespread vendor convention, e.g. GitHub/Stripe).
 	if resp != nil {
-		if d, ok := t.parseRetryAfterHeader(resp); ok {
+		if d, ok := t.parseServerWaitHint(resp); ok {
 			return d
 		}
 	}
@@ -146,24 +157,77 @@ func (t *retryTransport) backoff(attempt int, resp *http.Response) time.Duration
 	return wait
 }
 
-// parseRetryAfterHeader extracts a wait duration from the Retry-After header.
+// parseServerWaitHint extracts a wait duration from response headers,
+// trying Retry-After first, then RateLimit-Reset, then X-RateLimit-Reset.
 // The returned duration is floored at waitMin and capped at maxRetryAfter.
-func (t *retryTransport) parseRetryAfterHeader(resp *http.Response) (time.Duration, bool) {
-	ra := resp.Header.Get("Retry-After")
-	if ra == "" {
-		return 0, false
+func (t *retryTransport) parseServerWaitHint(resp *http.Response) (time.Duration, bool) {
+	sources := []struct {
+		name  string
+		parse func(string) time.Duration
+	}{
+		{"Retry-After", parseRetryAfter},
+		// RateLimit-Reset (RFC 9745 draft): always delta-seconds.
+		{"RateLimit-Reset", parseDeltaSeconds},
+		// X-RateLimit-Reset: usually delta-seconds, sometimes unix-epoch
+		// (GitHub). Heuristic: large values are treated as epoch.
+		{"X-RateLimit-Reset", parseDeltaSecondsOrEpoch},
 	}
-	d := parseRetryAfter(ra)
-	if d <= 0 {
-		return 0, false
+	for _, s := range sources {
+		raw := resp.Header.Get(s.name)
+		if raw == "" {
+			continue
+		}
+		d := s.parse(raw)
+		if d <= 0 {
+			continue
+		}
+		return t.clampServerWait(d), true
 	}
+	return 0, false
+}
+
+// clampServerWait floors at waitMin and caps at maxRetryAfter.
+func (t *retryTransport) clampServerWait(d time.Duration) time.Duration {
 	if t.waitMin > 0 {
 		d = max(d, t.waitMin)
 	}
 	if t.maxRetryAfter > 0 {
 		d = min(d, t.maxRetryAfter)
 	}
-	return d, true
+	return d
+}
+
+// epochHeuristicThreshold separates delta-seconds from unix-epoch for
+// X-RateLimit-Reset. Values above this are assumed to be seconds since
+// 1970, which places the crossover in September 2001 — any plausible
+// future unix time is above it, and any plausible delta-seconds wait is
+// below it.
+const epochHeuristicThreshold = 1_000_000_000
+
+// parseDeltaSeconds parses a positive integer count of seconds.
+func parseDeltaSeconds(val string) time.Duration {
+	if seconds, err := strconv.Atoi(val); err == nil && seconds > 0 {
+		return time.Duration(seconds) * time.Second
+	}
+	return 0
+}
+
+// parseDeltaSecondsOrEpoch parses either a delta-seconds count or a unix
+// epoch timestamp (seconds since 1970). Values above
+// epochHeuristicThreshold are treated as epoch.
+func parseDeltaSecondsOrEpoch(val string) time.Duration {
+	n, err := strconv.ParseInt(val, 10, 64)
+	if err != nil || n <= 0 {
+		return 0
+	}
+	if n >= epochHeuristicThreshold {
+		// Epoch seconds.
+		if d := time.Until(time.Unix(n, 0)); d > 0 {
+			return d
+		}
+		return 0
+	}
+	return time.Duration(n) * time.Second
 }
 
 func isRetryableError(err error) bool {
@@ -248,15 +312,15 @@ func prepareBody(req *http.Request, maxBytes int64) (func() (io.ReadCloser, erro
 	closeErr := req.Body.Close()
 
 	if readErr != nil {
-		return nil, fmt.Errorf("jttp: reading request body for retry: %w", readErr)
+		return nil, fmt.Errorf("%w: %w", ErrBodyRead, readErr)
 	}
 
 	if closeErr != nil {
-		return nil, fmt.Errorf("jttp: closing request body: %w", closeErr)
+		return nil, fmt.Errorf("%w: %w", ErrBodyClose, closeErr)
 	}
 
 	if maxBytes > 0 && int64(len(body)) > maxBytes {
-		return nil, fmt.Errorf("jttp: request body exceeds retry buffer limit (%d bytes)", maxBytes)
+		return nil, fmt.Errorf("%w (%d bytes)", ErrBodyTooLarge, maxBytes)
 	}
 
 	getBody := func() (io.ReadCloser, error) {
@@ -268,7 +332,7 @@ func prepareBody(req *http.Request, maxBytes int64) (func() (io.ReadCloser, erro
 	var bodyErr error
 	req.Body, bodyErr = getBody()
 	if bodyErr != nil {
-		return nil, fmt.Errorf("jttp: resetting request body: %w", bodyErr)
+		return nil, fmt.Errorf("%w: %w", ErrBodyRewind, bodyErr)
 	}
 
 	return getBody, nil
@@ -294,7 +358,7 @@ func (t *retryTransport) waitForRetry(
 	if getBody != nil {
 		body, err := getBody()
 		if err != nil {
-			return fmt.Errorf("jttp: rewinding request body: %w", err)
+			return fmt.Errorf("%w: %w", ErrBodyRewind, err)
 		}
 		req.Body = body
 	}
