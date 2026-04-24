@@ -85,7 +85,11 @@ func TestWithTransport(t *testing.T) {
 	custom := http.DefaultTransport
 	client := New(WithTransport(custom))
 	rt := client.Transport.(*retryTransport)
-	requireEqual(t, rt.next, custom)
+	st, ok := rt.next.(*safetyTransport)
+	if !ok {
+		t.Fatalf("retryTransport.next = %T, want *safetyTransport", rt.next)
+	}
+	requireEqual(t, st.next, custom)
 }
 
 func TestRetryOn503(t *testing.T) {
@@ -274,7 +278,7 @@ func TestRedirectPolicy(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	client := New(WithRetries(0))
+	client := New(WithRetries(0), WithAllowPrivateRedirects())
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
 	resp, err := client.Do(req)
 	if resp != nil {
@@ -581,8 +585,7 @@ func TestTransportConfigPropagation(t *testing.T) {
 	)
 
 	rt := client.Transport.(*retryTransport)
-	tr, ok := rt.next.(*http.Transport)
-	requireTrue(t, ok)
+	tr := innerHTTPTransport(t, rt)
 
 	requireEqual(t, tr.MaxIdleConns, 50)
 	requireEqual(t, tr.MaxIdleConnsPerHost, 25)
@@ -603,7 +606,7 @@ func TestWithTLSConfig(t *testing.T) {
 	}
 	client := New(WithTLSConfig(custom), WithRetries(0))
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 
 	requireEqual(t, tr.TLSClientConfig.ServerName, "custom.example.com")
 	requireTrue(t, tr.TLSClientConfig.MinVersion >= tls.VersionTLS12)
@@ -615,7 +618,7 @@ func TestWithTLSConfigEnforcesMinVersion(t *testing.T) {
 	}
 	client := New(WithTLSConfig(custom), WithRetries(0))
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 
 	requireEqual(t, tr.TLSClientConfig.MinVersion, uint16(tls.VersionTLS12))
 }
@@ -774,7 +777,7 @@ func TestTLSConfigNotMutated(t *testing.T) {
 func TestDefaultResponseHeaderTimeout(t *testing.T) {
 	client := New(WithRetries(0))
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 	requireEqual(t, tr.ResponseHeaderTimeout, DefaultResponseHeaderTimeout)
 	requireTrue(t, tr.ResponseHeaderTimeout > 0)
 }
@@ -782,7 +785,7 @@ func TestDefaultResponseHeaderTimeout(t *testing.T) {
 func TestDefaultMaxConnsPerHost(t *testing.T) {
 	client := New(WithRetries(0))
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 	requireEqual(t, tr.MaxConnsPerHost, DefaultMaxConnsPerHost)
 	requireTrue(t, tr.MaxConnsPerHost > 0)
 }
@@ -814,7 +817,7 @@ func TestNegativeDurationsClamped(t *testing.T) {
 	requireEqual(t, client.Timeout, time.Duration(0))
 
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 	requireEqual(t, tr.TLSHandshakeTimeout, time.Duration(0))
 	requireEqual(t, tr.ResponseHeaderTimeout, time.Duration(0))
 	requireEqual(t, tr.ExpectContinueTimeout, time.Duration(0))
@@ -1062,7 +1065,7 @@ func TestWithDialContextOverridesResolver(t *testing.T) {
 func TestWithProxy(t *testing.T) {
 	client := New(WithProxy(http.ProxyFromEnvironment), WithNoRetries())
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 	// Verify the transport was built (not nil) — we can't compare function
 	// pointers directly, but we can verify the transport exists.
 	requireTrue(t, tr != nil)
@@ -1084,7 +1087,7 @@ func TestWithNoProxy(t *testing.T) {
 func TestWithMaxResponseHeaderBytes(t *testing.T) {
 	client := New(WithMaxResponseHeaderBytes(1<<20), WithNoRetries())
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 	requireEqual(t, tr.MaxResponseHeaderBytes, int64(1<<20))
 }
 
@@ -1111,4 +1114,114 @@ func TestDialContextIgnoredWithTransport(t *testing.T) {
 	requireNoErr(t, err)
 	resp.Body.Close()
 	requireFalse(t, dialCalled.Load())
+}
+
+func TestTier1ConfigDefaults(t *testing.T) {
+	cfg := defaults()
+	if cfg.idleTimeout != DefaultIdleTimeout {
+		t.Errorf("idleTimeout default = %v, want %v", cfg.idleTimeout, DefaultIdleTimeout)
+	}
+	if cfg.maxCompressionRatio != DefaultMaxCompressionRatio {
+		t.Errorf("maxCompressionRatio default = %v, want %v", cfg.maxCompressionRatio, DefaultMaxCompressionRatio)
+	}
+	if cfg.minRate != 0 {
+		t.Errorf("minRate default = %d, want 0", cfg.minRate)
+	}
+	if cfg.maxResponseBodyBytes != 0 {
+		t.Errorf("maxResponseBodyBytes default = %d, want 0", cfg.maxResponseBodyBytes)
+	}
+	if cfg.allowSchemeDowngrade {
+		t.Error("allowSchemeDowngrade default must be false")
+	}
+	if cfg.allowPrivateRedirects {
+		t.Error("allowPrivateRedirects default must be false")
+	}
+	if cfg.strictSSRFInitial {
+		t.Error("strictSSRFInitial default must be false")
+	}
+	if len(cfg.sensitiveHeaders) != 0 {
+		t.Errorf("sensitiveHeaders default = %v, want empty", cfg.sensitiveHeaders)
+	}
+}
+
+func TestWithIdleTimeout(t *testing.T) {
+	cfg := defaults()
+	WithIdleTimeout(7 * time.Second)(cfg)
+	if cfg.idleTimeout != 7*time.Second {
+		t.Errorf("got %v", cfg.idleTimeout)
+	}
+}
+
+func TestWithMinTransferRate(t *testing.T) {
+	cfg := defaults()
+	WithMinTransferRate(500, 2*time.Second)(cfg)
+	if cfg.minRate != 500 {
+		t.Errorf("minRate = %d", cfg.minRate)
+	}
+	if cfg.minRateWindow != 2*time.Second {
+		t.Errorf("minRateWindow = %v", cfg.minRateWindow)
+	}
+}
+
+func TestWithMaxResponseBodyBytes(t *testing.T) {
+	cfg := defaults()
+	WithMaxResponseBodyBytes(1024)(cfg)
+	if cfg.maxResponseBodyBytes != 1024 {
+		t.Errorf("got %d", cfg.maxResponseBodyBytes)
+	}
+}
+
+func TestWithMaxCompressionRatio(t *testing.T) {
+	cfg := defaults()
+	WithMaxCompressionRatio(50)(cfg)
+	if cfg.maxCompressionRatio != 50 {
+		t.Errorf("got %v", cfg.maxCompressionRatio)
+	}
+}
+
+func TestWithAllowSchemeDowngrade(t *testing.T) {
+	cfg := defaults()
+	WithAllowSchemeDowngrade()(cfg)
+	if !cfg.allowSchemeDowngrade {
+		t.Error("not set")
+	}
+}
+
+func TestWithAllowPrivateRedirects(t *testing.T) {
+	cfg := defaults()
+	WithAllowPrivateRedirects()(cfg)
+	if !cfg.allowPrivateRedirects {
+		t.Error("not set")
+	}
+}
+
+func TestWithStrictSSRFProtection(t *testing.T) {
+	cfg := defaults()
+	WithStrictSSRFProtection()(cfg)
+	if !cfg.strictSSRFInitial {
+		t.Error("not set")
+	}
+}
+
+func TestWithSensitiveHeaders(t *testing.T) {
+	cfg := defaults()
+	WithSensitiveHeaders("X-Foo", "X-Bar")(cfg)
+	if len(cfg.sensitiveHeaders) != 2 {
+		t.Fatalf("len = %d", len(cfg.sensitiveHeaders))
+	}
+	if cfg.sensitiveHeaders[0] != "X-Foo" || cfg.sensitiveHeaders[1] != "X-Bar" {
+		t.Errorf("headers = %v", cfg.sensitiveHeaders)
+	}
+}
+
+func TestWithSensitiveHeadersDoesNotShareSlice(t *testing.T) {
+	// Caller-supplied slice must be copied — mutating their slice post-call
+	// must not affect our config.
+	src := []string{"X-Original"}
+	cfg := defaults()
+	WithSensitiveHeaders(src...)(cfg)
+	src[0] = "X-Mutated"
+	if cfg.sensitiveHeaders[0] != "X-Original" {
+		t.Errorf("slice aliasing: got %q, want X-Original", cfg.sensitiveHeaders[0])
+	}
 }

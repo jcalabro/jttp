@@ -1,6 +1,7 @@
 package jttp
 
 import (
+	"net/http"
 	"strings"
 	"testing"
 )
@@ -46,4 +47,20 @@ func requireFalse(t testing.TB, v bool) {
 	if v {
 		t.Fatal("expected false, got true")
 	}
+}
+
+// innerHTTPTransport unwraps the jttp transport chain
+// (retryTransport -> safetyTransport -> *http.Transport) to the underlying
+// *http.Transport. Fatals the test if any layer has the wrong type.
+func innerHTTPTransport(t testing.TB, rt *retryTransport) *http.Transport {
+	t.Helper()
+	st, ok := rt.next.(*safetyTransport)
+	if !ok {
+		t.Fatalf("retryTransport.next = %T, want *safetyTransport", rt.next)
+	}
+	tr, ok := st.next.(*http.Transport)
+	if !ok {
+		t.Fatalf("safetyTransport.next = %T, want *http.Transport", st.next)
+	}
+	return tr
 }

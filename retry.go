@@ -240,6 +240,12 @@ func isRetryableError(err error) bool {
 		return false
 	}
 
+	// Write-side idle timeouts fired during RoundTrip are transient and
+	// warrant retry on a fresh connection.
+	if errors.Is(err, ErrBodyIdleTimeout) {
+		return true
+	}
+
 	// Connection closed unexpectedly.
 	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return true

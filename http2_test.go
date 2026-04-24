@@ -55,7 +55,7 @@ func TestHTTP2ReadIdleTimeoutZeroDisables(t *testing.T) {
 func TestForceHTTP2FalseSkipsH2Configuration(t *testing.T) {
 	client := New(WithForceHTTP2(false), WithNoRetries())
 	rt := client.Transport.(*retryTransport)
-	tr := rt.next.(*http.Transport)
+	tr := innerHTTPTransport(t, rt)
 	requireFalse(t, tr.ForceAttemptHTTP2)
 	requireTrue(t, rt.http2Transport == nil)
 }

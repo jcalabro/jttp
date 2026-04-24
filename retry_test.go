@@ -408,3 +408,25 @@ func TestMaxRetryAfterNegativeClamped(t *testing.T) {
 	rt := client.Transport.(*retryTransport)
 	requireEqual(t, rt.maxRetryAfter, DefaultMaxRetryAfter)
 }
+
+func TestIsRetryableErrorIncludesBodyIdleTimeout(t *testing.T) {
+	if !isRetryableError(ErrBodyIdleTimeout) {
+		t.Error("ErrBodyIdleTimeout should be retryable")
+	}
+}
+
+func TestPolicyErrorsNotRetryable(t *testing.T) {
+	cases := []error{
+		ErrRedirectLoop,
+		ErrSchemeDowngrade,
+		ErrBlockedByIPPolicy,
+		ErrResponseTooLarge,
+		ErrDecompressionBomb,
+		ErrBodyTransferTooSlow,
+	}
+	for _, err := range cases {
+		if isRetryableError(err) {
+			t.Errorf("isRetryableError(%v) = true, want false", err)
+		}
+	}
+}

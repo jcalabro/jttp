@@ -1,8 +1,19 @@
-// Package jttp provides a robust HTTP client with reasonable defaults and tunable behavior.
+// Package jttp provides a robust HTTP client with reasonable defaults and
+// tunable behavior.
 //
-// The returned *http.Client is fully standard — callers use client.Do, client.Get, etc.
-// Optional retry logic is implemented at the RoundTripper layer with exponential backoff
-// and jitter.
+// The returned *http.Client is fully standard — callers use client.Do,
+// client.Get, etc. Built-in protections:
+//
+//   - Retry with exponential backoff + jitter, Retry-After honoring
+//   - HTTP/2 health-check pings (detects black-holed connections)
+//   - TLS 1.2+ minimum, session cache by default
+//   - Idle timeout on request-body writes and response-body reads (30s)
+//   - Decompression-bomb guard (1000:1 ratio)
+//   - Redirect loop detection, scheme-downgrade refusal, SSRF filter on
+//     private / loopback / link-local / IMDS addresses
+//
+// All defaults can be overridden via Option values. See the With* options
+// below.
 //
 // Basic usage:
 //
@@ -48,6 +59,8 @@ const (
 	DefaultExpectContinueTimeout = 2 * time.Second
 	DefaultMaxRetryBodyBytes     = 4 << 20 // 4 MiB
 	DefaultMaxRetryAfter         = 1 * time.Minute
+	DefaultIdleTimeout           = 30 * time.Second
+	DefaultMaxCompressionRatio   = 1000.0
 )
 
 // defaultTLSSessionCacheCapacity is the LRU size used when the caller hasn't
@@ -97,6 +110,21 @@ type config struct {
 
 	// Transport escape hatch
 	transport http.RoundTripper
+
+	// Slow-transfer
+	idleTimeout   time.Duration
+	minRate       int64
+	minRateWindow time.Duration
+
+	// Response size / decompression
+	maxResponseBodyBytes int64
+	maxCompressionRatio  float64
+
+	// Redirect safety
+	allowSchemeDowngrade  bool
+	allowPrivateRedirects bool
+	strictSSRFInitial     bool
+	sensitiveHeaders      []string
 }
 
 func defaults() *config {
@@ -133,6 +161,8 @@ func defaults() *config {
 			http.MethodHead:    {},
 			http.MethodOptions: {},
 		},
+		idleTimeout:         DefaultIdleTimeout,
+		maxCompressionRatio: DefaultMaxCompressionRatio,
 	}
 }
 
@@ -228,7 +258,7 @@ func New(opts ...Option) *http.Client {
 			ExpectContinueTimeout:  cfg.expectContinueTimeout,
 			ForceAttemptHTTP2:      cfg.forceHTTP2,
 			DisableKeepAlives:      cfg.disableKeepAlives,
-			DisableCompression:     cfg.disableCompression,
+			DisableCompression:     true,
 			TLSClientConfig:        tlsCfg,
 		}
 		if cfg.forceHTTP2 {
@@ -250,8 +280,34 @@ func New(opts ...Option) *http.Client {
 		base = tr
 	}
 
+	// Construct the redirect guard first — the safety transport needs a pointer
+	// to it for strict-SSRF checks on the initial URL.
+	rGuard := newRedirectGuard(redirectConfig{
+		maxRedirects:     cfg.maxRedirects,
+		allowDowngrade:   cfg.allowSchemeDowngrade,
+		allowPrivate:     cfg.allowPrivateRedirects,
+		strictInitial:    cfg.strictSSRFInitial,
+		sensitiveHeaders: cfg.sensitiveHeaders,
+		resolver:         cfg.resolver,
+	})
+
+	// safetyTransport sits between retry and the base transport.
+	st := &safetyTransport{
+		next: base,
+		cfg: safetyConfig{
+			compressionEnabled: !cfg.disableCompression,
+			maxBytes:           cfg.maxResponseBodyBytes,
+			idleTimeout:        cfg.idleTimeout,
+			minRate:            cfg.minRate,
+			minRateWindow:      cfg.minRateWindow,
+			maxRatio:           cfg.maxCompressionRatio,
+			strictSSRFInitial:  cfg.strictSSRFInitial,
+			redirectGuard:      rGuard,
+		},
+	}
+
 	rt := &retryTransport{
-		next:              base,
+		next:              st,
 		maxRetries:        cfg.maxRetries,
 		waitMin:           cfg.retryWaitMin,
 		waitMax:           cfg.retryWaitMax,
@@ -275,13 +331,7 @@ func New(opts ...Option) *http.Client {
 			return http.ErrUseLastResponse
 		}
 	} else {
-		maxRedirects := cfg.maxRedirects
-		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
-			if len(via) >= maxRedirects {
-				return fmt.Errorf("%w: stopped after %d redirects", ErrTooManyRedirects, maxRedirects)
-			}
-			return nil
-		}
+		client.CheckRedirect = rGuard.check
 	}
 
 	return client
@@ -455,7 +505,16 @@ func WithRetryObserver(fn func(attempt int, req *http.Request, resp *http.Respon
 }
 
 // WithTransport provides a custom base RoundTripper, bypassing the default
-// transport construction. Retry logic is still applied on top.
+// transport construction. Retry logic and response-body guards (idle
+// timeout, size cap, min-rate) are still applied on top, but note:
+//
+// The decompression-bomb guard (WithMaxCompressionRatio) is effectively
+// disabled when a custom transport is supplied, because jttp can no longer
+// control the base transport's DisableCompression setting. The caller's
+// transport is presumed to handle Accept-Encoding / gzip decoding itself,
+// and once stdlib's default transport auto-decodes, the response arrives
+// without a Content-Encoding header for jttp to act on. If you need the
+// bomb guard, use the default transport.
 func WithTransport(rt http.RoundTripper) Option {
 	return func(c *config) { c.transport = rt }
 }
@@ -559,4 +618,62 @@ func WithNoProxy() Option {
 // This option is ignored when WithTransport is used.
 func WithMaxResponseHeaderBytes(n int64) Option {
 	return func(c *config) { c.maxResponseHeaderBytes = n }
+}
+
+// WithIdleTimeout sets the idle timeout applied to both response-body reads
+// and request-body writes. If no bytes flow in either direction for this long,
+// the request is cancelled with ErrBodyIdleTimeout. 0 disables. Default: 30s.
+func WithIdleTimeout(d time.Duration) Option {
+	return func(c *config) { c.idleTimeout = d }
+}
+
+// WithMinTransferRate sets a minimum average transfer rate (bytes per second)
+// for the response body, measured over the given rolling window. If the
+// observed rate stays below bps for a full window, the read fails with
+// ErrBodyTransferTooSlow. Default: disabled. Matches curl --speed-limit /
+// --speed-time.
+func WithMinTransferRate(bps int64, window time.Duration) Option {
+	return func(c *config) { c.minRate = bps; c.minRateWindow = window }
+}
+
+// WithMaxResponseBodyBytes sets a hard cap on the decompressed response
+// body size. Reads past this limit fail with ErrResponseTooLarge. 0 disables
+// (unlimited). Default: 0.
+func WithMaxResponseBodyBytes(n int64) Option {
+	return func(c *config) { c.maxResponseBodyBytes = n }
+}
+
+// WithMaxCompressionRatio sets the maximum allowed decompressed:compressed
+// ratio when gzip decoding is in effect. The guard activates only once at
+// least 64 KiB of compressed bytes have been read, to avoid false positives
+// on small responses. 0 disables. Default: 1000.
+func WithMaxCompressionRatio(r float64) Option {
+	return func(c *config) { c.maxCompressionRatio = r }
+}
+
+// WithAllowSchemeDowngrade opts out of refusing https -> http redirects.
+func WithAllowSchemeDowngrade() Option {
+	return func(c *config) { c.allowSchemeDowngrade = true }
+}
+
+// WithAllowPrivateRedirects opts out of the SSRF redirect guard.
+// When set, redirects to loopback / private / link-local / IMDS addresses are allowed.
+func WithAllowPrivateRedirects() Option {
+	return func(c *config) { c.allowPrivateRedirects = true }
+}
+
+// WithStrictSSRFProtection also applies the IP policy to the initial
+// request URL (not just redirects). Useful for services accepting
+// attacker-controlled URLs.
+func WithStrictSSRFProtection() Option {
+	return func(c *config) { c.strictSSRFInitial = true }
+}
+
+// WithSensitiveHeaders marks additional header names to strip when a redirect
+// crosses origins. The stdlib already strips Authorization and cookies; this
+// extends the set for bearer tokens, API keys, and so on.
+func WithSensitiveHeaders(names ...string) Option {
+	return func(c *config) {
+		c.sensitiveHeaders = append([]string(nil), names...)
+	}
 }

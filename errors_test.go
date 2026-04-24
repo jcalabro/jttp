@@ -3,10 +3,12 @@ package jttp
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -70,12 +72,14 @@ func TestErrBodyRewindSentinel(t *testing.T) {
 }
 
 func TestErrTooManyRedirectsSentinel(t *testing.T) {
+	var count atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, "/next", http.StatusFound)
+		n := count.Add(1)
+		http.Redirect(w, r, fmt.Sprintf("/next-%d", n), http.StatusFound)
 	}))
 	defer srv.Close()
 
-	client := New(WithRetries(0), WithRedirectPolicy(3))
+	client := New(WithRetries(0), WithRedirectPolicy(3), WithAllowPrivateRedirects())
 	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, srv.URL, http.NoBody)
 	resp, err := client.Do(req)
 	if resp != nil {
@@ -83,4 +87,23 @@ func TestErrTooManyRedirectsSentinel(t *testing.T) {
 	}
 	requireIsErr(t, err)
 	requireTrue(t, errors.Is(err, ErrTooManyRedirects))
+}
+
+func TestTier1SentinelsDefined(t *testing.T) {
+	for _, err := range []error{
+		ErrBodyIdleTimeout,
+		ErrBodyTransferTooSlow,
+		ErrResponseTooLarge,
+		ErrDecompressionBomb,
+		ErrRedirectLoop,
+		ErrSchemeDowngrade,
+		ErrBlockedByIPPolicy,
+	} {
+		if err == nil {
+			t.Errorf("sentinel is nil")
+		}
+		if err.Error() == "" {
+			t.Errorf("sentinel has empty message: %v", err)
+		}
+	}
 }
