@@ -214,3 +214,56 @@ func TestSafetyTransportDecodesGzipResponseAndStripsHeader(t *testing.T) {
 		t.Errorf("decoded = %q, want hello", got)
 	}
 }
+
+func TestSafetyTransportObservesResponseBodyBytesOnClose(t *testing.T) {
+	// A valid gzip stream for "hello".
+	gzipHello := []byte{
+		0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xff,
+		0xca, 0x48, 0xcd, 0xc9, 0xc9, 0x07, 0x04, 0x00, 0x00, 0xff, 0xff,
+		0x86, 0xa6, 0x10, 0x36, 0x05, 0x00, 0x00, 0x00,
+	}
+	s := &stubTransport{
+		body: string(gzipHello),
+		header: http.Header{
+			"Content-Encoding": []string{"gzip"},
+		},
+	}
+
+	var got BodyObservation
+	st := &safetyTransport{
+		next: s,
+		cfg: safetyConfig{
+			compressionEnabled: true,
+			bodyObserver: func(obs BodyObservation) {
+				got = obs
+			},
+		},
+	}
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://x/path", http.NoBody)
+	resp, err := st.RoundTrip(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := io.ReadAll(resp.Body); err != nil {
+		t.Fatal(err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got.URL != "http://x/path" {
+		t.Errorf("URL = %q, want request URL", got.URL)
+	}
+	if got.StatusCode != http.StatusOK {
+		t.Errorf("StatusCode = %d, want 200", got.StatusCode)
+	}
+	if got.CompressedBytes != int64(len(gzipHello)) {
+		t.Errorf("CompressedBytes = %d, want %d", got.CompressedBytes, len(gzipHello))
+	}
+	if got.UncompressedBytes != int64(len("hello")) {
+		t.Errorf("UncompressedBytes = %d, want %d", got.UncompressedBytes, len("hello"))
+	}
+	if got.Duration <= 0 {
+		t.Errorf("Duration = %s, want positive", got.Duration)
+	}
+}

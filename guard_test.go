@@ -461,6 +461,92 @@ func BenchmarkRateTrackerObserveFullWindow(b *testing.B) {
 	}
 }
 
+func BenchmarkGuardedBodyGzipDecode(b *testing.B) {
+	for _, tc := range []struct {
+		name    string
+		payload []byte
+	}{
+		{name: "repoish", payload: benchmarkRepoishPayload(32 << 20)},
+		{name: "high_entropy", payload: benchmarkHighEntropyPayload(32 << 20)},
+	} {
+		b.Run(tc.name, func(b *testing.B) {
+			var gzipped bytes.Buffer
+			zw, err := gzip.NewWriterLevel(&gzipped, gzip.DefaultCompression)
+			if err != nil {
+				b.Fatal(err)
+			}
+			if _, err := zw.Write(tc.payload); err != nil {
+				b.Fatal(err)
+			}
+			if err := zw.Close(); err != nil {
+				b.Fatal(err)
+			}
+
+			b.SetBytes(int64(len(tc.payload)))
+			b.ReportMetric(float64(len(tc.payload))/float64(gzipped.Len()), "ratio")
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				ctx, cancel := context.WithCancelCause(context.Background())
+				gb, err := newGuardedBody(io.NopCloser(bytes.NewReader(gzipped.Bytes())), guardedBodyConfig{
+					ctx:            ctx,
+					cancel:         cancel,
+					decompressGzip: true,
+					maxRatio:       1000,
+				})
+				if err != nil {
+					cancel(nil)
+					b.Fatal(err)
+				}
+				if _, err := io.CopyBuffer(io.Discard, gb, make([]byte, 128<<10)); err != nil {
+					_ = gb.Close()
+					cancel(nil)
+					b.Fatal(err)
+				}
+				if err := gb.Close(); err != nil {
+					cancel(nil)
+					b.Fatal(err)
+				}
+				cancel(nil)
+			}
+		})
+	}
+}
+
+func benchmarkRepoishPayload(n int) []byte {
+	payload := make([]byte, 0, n)
+	var x uint64 = 0x123456789abcdef0
+	templates := [][]byte{
+		[]byte(`{"$type":"app.bsky.feed.post","text":"hello from a busy repo","createdAt":"2026-06-16T18:00:00.000Z"}`),
+		[]byte(`app.bsky.feed.like/3lq2example cid bafyreigenericrecord did:plc:example`),
+		[]byte(`app.bsky.graph.follow/3lq2example subject did:plc:subject collection rkey`),
+		[]byte(`com.atproto.repo.strongRef uri at://did:plc:author/app.bsky.feed.post/3lq2example`),
+	}
+	for len(payload) < n {
+		tpl := templates[len(payload)/4096%len(templates)]
+		payload = append(payload, tpl...)
+		for range 64 {
+			x ^= x << 13
+			x ^= x >> 7
+			x ^= x << 17
+			payload = append(payload, byte(x))
+		}
+	}
+	return payload[:n]
+}
+
+func benchmarkHighEntropyPayload(n int) []byte {
+	payload := make([]byte, n)
+	var x uint64 = 0x123456789abcdef0
+	for i := range payload {
+		x ^= x << 13
+		x ^= x >> 7
+		x ^= x << 17
+		payload[i] = byte(x) ^ byte(i/4096)
+	}
+	return payload
+}
+
 func gzipZeros(t *testing.T, n int) []byte {
 	t.Helper()
 	var buf bytes.Buffer

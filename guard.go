@@ -1,13 +1,14 @@
 package jttp
 
 import (
-	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/klauspost/compress/gzip"
 )
 
 // idleWatchdog cancels a context with a given cause if Reset is not called
@@ -91,6 +92,21 @@ type guardedBodyConfig struct {
 	minRateWindow  time.Duration // window over which to average
 	decompressGzip bool          // wrap inner in gzip.Reader
 	maxRatio       float64       // 0 disables the ratio guard
+	bodyObserver   func(BodyObservation)
+	observeURL     string
+	statusCode     int
+	observeStarted time.Time
+}
+
+// BodyObservation reports response-body byte counts when a guarded response
+// body is closed. It is intentionally generic: callers that need
+// request-specific labels can derive them from URL.
+type BodyObservation struct {
+	URL               string
+	StatusCode        int
+	CompressedBytes   int64
+	UncompressedBytes int64
+	Duration          time.Duration
 }
 
 // guardedBody wraps an http.Response.Body with robustness protections.
@@ -179,6 +195,19 @@ func (g *guardedBody) Close() error {
 			}
 		}
 		g.closeErr = g.inner.Close()
+		if g.cfg.bodyObserver != nil {
+			compressed := g.readBytes
+			if g.compressed != nil {
+				compressed = g.compressed.total
+			}
+			g.cfg.bodyObserver(BodyObservation{
+				URL:               g.cfg.observeURL,
+				StatusCode:        g.cfg.statusCode,
+				CompressedBytes:   compressed,
+				UncompressedBytes: g.readBytes,
+				Duration:          time.Since(g.cfg.observeStarted),
+			})
+		}
 	})
 	return g.closeErr
 }

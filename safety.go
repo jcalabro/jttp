@@ -19,6 +19,7 @@ type safetyConfig struct {
 	minRate       int64
 	minRateWindow time.Duration
 	maxRatio      float64
+	bodyObserver  func(BodyObservation)
 
 	// SSRF: if true, the safety transport blocks the initial request too
 	// (the redirectGuard handles subsequent ones via http.Client.CheckRedirect).
@@ -37,6 +38,8 @@ type safetyTransport struct {
 }
 
 func (t *safetyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	observeStarted := time.Now()
+
 	// Strict SSRF: reject the initial request if target resolves to blocked.
 	if t.cfg.strictSSRFInitial && t.cfg.redirectGuard != nil {
 		if err := t.cfg.redirectGuard.checkIPPolicy(req.Context(), req.URL.Hostname()); err != nil {
@@ -106,6 +109,10 @@ func (t *safetyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		minRateWindow:  t.cfg.minRateWindow,
 		decompressGzip: decompressGzip,
 		maxRatio:       t.cfg.maxRatio,
+		bodyObserver:   t.cfg.bodyObserver,
+		observeURL:     req.URL.String(),
+		statusCode:     resp.StatusCode,
+		observeStarted: observeStarted,
 	})
 	if gerr != nil {
 		// Close the raw body and tear down the watchdogs — otherwise a

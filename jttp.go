@@ -119,6 +119,7 @@ type config struct {
 	// Response size / decompression
 	maxResponseBodyBytes int64
 	maxCompressionRatio  float64
+	bodyObserver         func(BodyObservation)
 
 	// Redirect safety
 	allowSchemeDowngrade  bool
@@ -301,6 +302,7 @@ func New(opts ...Option) *http.Client {
 			minRate:            cfg.minRate,
 			minRateWindow:      cfg.minRateWindow,
 			maxRatio:           cfg.maxCompressionRatio,
+			bodyObserver:       cfg.bodyObserver,
 			strictSSRFInitial:  cfg.strictSSRFInitial,
 			redirectGuard:      rGuard,
 		},
@@ -538,6 +540,13 @@ func WithDisableKeepAlives() Option {
 // the actual body size.
 func WithDisableCompression() Option {
 	return func(c *config) { c.disableCompression = true }
+}
+
+// WithBodyObserver registers a callback invoked when a guarded response body
+// is closed. This is intended for temporary diagnostics where callers need
+// precise response byte counts without changing higher-level APIs.
+func WithBodyObserver(fn func(BodyObservation)) Option {
+	return func(c *config) { c.bodyObserver = fn }
 }
 
 // WithForceHTTP2 controls whether HTTP/2 is attempted when a custom TLS
