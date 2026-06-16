@@ -414,6 +414,53 @@ func TestGuardedBodyMinRateHonestReaderPasses(t *testing.T) {
 	}
 }
 
+func TestRateTrackerMaintainsRollingWindowTotal(t *testing.T) {
+	r := newRateTracker(10 * time.Second)
+	base := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+
+	bps, full := r.observeAt(base, 100)
+	if full {
+		t.Fatalf("window should not be full after first sample: bps=%d", bps)
+	}
+	if r.bytesInWindow != 100 {
+		t.Fatalf("bytesInWindow after first sample = %d, want 100", r.bytesInWindow)
+	}
+
+	bps, full = r.observeAt(base.Add(5*time.Second), 200)
+	if full {
+		t.Fatalf("window should not be full after five seconds: bps=%d", bps)
+	}
+	if r.bytesInWindow != 300 {
+		t.Fatalf("bytesInWindow before trim = %d, want 300", r.bytesInWindow)
+	}
+
+	bps, full = r.observeAt(base.Add(11*time.Second), 300)
+	if !full {
+		t.Fatal("window should be full after eleven seconds")
+	}
+	if r.bytesInWindow != 500 {
+		t.Fatalf("bytesInWindow after trim = %d, want 500", r.bytesInWindow)
+	}
+	if bps != 50 {
+		t.Fatalf("bps = %d, want 50", bps)
+	}
+}
+
+func BenchmarkRateTrackerObserveFullWindow(b *testing.B) {
+	r := newRateTracker(60 * time.Second)
+	base := time.Date(2026, 6, 16, 12, 0, 0, 0, time.UTC)
+	for i := range 60_000 {
+		r.observeAt(base.Add(time.Duration(i)*time.Millisecond), 4096)
+	}
+	now := base.Add(60 * time.Second)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		r.observeAt(now.Add(time.Duration(i)*time.Millisecond), 4096)
+	}
+}
+
 func gzipZeros(t *testing.T, n int) []byte {
 	t.Helper()
 	var buf bytes.Buffer

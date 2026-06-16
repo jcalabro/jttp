@@ -215,9 +215,10 @@ var _ io.ReadCloser = (*guardedBody)(nil)
 // reflects "time since bytes started flowing" rather than "time since the
 // tracker object was allocated."
 type rateTracker struct {
-	window     time.Duration
-	firstTime  time.Time // zero until first observed sample
-	samples    []rateSample
+	window        time.Duration
+	firstTime     time.Time // zero until first observed sample
+	samples       []rateSample
+	bytesInWindow int64
 }
 
 type rateSample struct {
@@ -235,8 +236,13 @@ func newRateTracker(window time.Duration) *rateTracker {
 // time since the first sample so the rate is meaningful).
 func (r *rateTracker) observe(n int64) (bps int64, windowFull bool) {
 	now := time.Now()
+	return r.observeAt(now, n)
+}
+
+func (r *rateTracker) observeAt(now time.Time, n int64) (bps int64, windowFull bool) {
 	if n > 0 {
 		r.samples = append(r.samples, rateSample{t: now, bytes: n})
+		r.bytesInWindow += n
 		if r.firstTime.IsZero() {
 			r.firstTime = now
 		}
@@ -249,21 +255,20 @@ func (r *rateTracker) observe(n int64) (bps int64, windowFull bool) {
 		}
 	}
 	if trim > 0 {
+		for _, s := range r.samples[:trim] {
+			r.bytesInWindow -= s.bytes
+		}
 		r.samples = r.samples[trim:]
 	}
 
 	if r.firstTime.IsZero() || now.Sub(r.firstTime) < r.window {
 		return 0, false
 	}
-	var total int64
-	for _, s := range r.samples {
-		total += s.bytes
-	}
 	secs := r.window.Seconds()
 	if secs <= 0 {
 		return 0, true
 	}
-	return int64(float64(total) / secs), true
+	return int64(float64(r.bytesInWindow) / secs), true
 }
 
 // bombGuardMinCompressed is the minimum number of compressed bytes that must
