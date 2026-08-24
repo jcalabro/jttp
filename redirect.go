@@ -102,6 +102,7 @@ type redirectConfig struct {
 	strictInitial    bool
 	sensitiveHeaders []string // caller-supplied, canonical form not enforced
 	resolver         ipLookuper
+	ipPolicyAtDial   bool
 }
 
 // redirectGuard bundles loop detection, scheme-downgrade refusal, SSRF
@@ -142,7 +143,7 @@ func (g *redirectGuard) check(req *http.Request, via []*http.Request) error {
 	}
 
 	// 4. SSRF guard.
-	if !g.cfg.allowPrivate {
+	if !g.cfg.allowPrivate && !g.cfg.ipPolicyAtDial {
 		if err := g.checkIPPolicy(req.Context(), target.Hostname()); err != nil {
 			return err
 		}
