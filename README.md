@@ -38,4 +38,19 @@ client := jttp.New(
 )
 ```
 
+For attacker-controlled URLs, combine strict SSRF protection with direct
+dialing so validation is bound to the connection and DNS is resolved only
+once per new connection:
+
+```go
+client := jttp.New(
+    jttp.WithStrictSSRFProtection(),
+    jttp.WithNoProxy(),
+)
+```
+
+With a proxy or custom transport, jttp cannot control the target dial and
+retains request-time DNS preflight checks instead. The same is true when
+private redirects are explicitly allowed.
+
 See [godoc](https://pkg.go.dev/github.com/jcalabro/jttp) for the full option list.

@@ -1203,6 +1203,42 @@ func TestWithStrictSSRFProtection(t *testing.T) {
 	}
 }
 
+func TestStrictSSRFDirectModeUsesDialPolicy(t *testing.T) {
+	client := New(WithStrictSSRFProtection(), WithNoProxy(), WithNoRetries())
+	rt := client.Transport.(*retryTransport)
+	st := rt.next.(*safetyTransport)
+	if st.cfg.strictSSRFInitial {
+		t.Error("request-time preflight must be disabled when strict policy is bound to the dial")
+	}
+	if !st.cfg.redirectGuard.cfg.ipPolicyAtDial {
+		t.Error("redirect guard must know the dial enforces the IP policy")
+	}
+}
+
+func TestStrictSSRFProxyModeRetainsPreflight(t *testing.T) {
+	client := New(WithStrictSSRFProtection(), WithProxy(http.ProxyFromEnvironment), WithNoRetries())
+	rt := client.Transport.(*retryTransport)
+	st := rt.next.(*safetyTransport)
+	if !st.cfg.strictSSRFInitial {
+		t.Error("proxy mode must retain request-time SSRF preflight")
+	}
+	if st.cfg.redirectGuard.cfg.ipPolicyAtDial {
+		t.Error("proxy mode must not claim the target IP policy is bound to the dial")
+	}
+}
+
+func TestStrictSSRFAllowPrivateRedirectsRetainsPreflight(t *testing.T) {
+	client := New(WithStrictSSRFProtection(), WithNoProxy(), WithAllowPrivateRedirects(), WithNoRetries())
+	rt := client.Transport.(*retryTransport)
+	st := rt.next.(*safetyTransport)
+	if !st.cfg.strictSSRFInitial {
+		t.Error("allow-private redirect mode must retain initial-request SSRF preflight")
+	}
+	if st.cfg.redirectGuard.cfg.ipPolicyAtDial {
+		t.Error("allow-private redirect mode cannot enforce a connection-wide target IP policy")
+	}
+}
+
 func TestWithSensitiveHeaders(t *testing.T) {
 	cfg := defaults()
 	WithSensitiveHeaders("X-Foo", "X-Bar")(cfg)

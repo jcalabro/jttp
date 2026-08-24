@@ -93,6 +93,7 @@ type config struct {
 	dialContext            func(ctx context.Context, network, address string) (net.Conn, error)
 	resolver               *net.Resolver
 	proxy                  func(*http.Request) (*url.URL, error)
+	disableProxy           bool
 
 	// Retries
 	maxRetries           int
@@ -228,10 +229,12 @@ func New(opts ...Option) *http.Client {
 			tlsCfg.ClientSessionCache = tls.NewLRUClientSessionCache(defaultTLSSessionCacheCapacity)
 		}
 
-		// Build the dial function. WithDialContext takes full precedence;
-		// otherwise the default dialer is used with an optional custom
-		// resolver (WithResolver).
+		// Build the dial function. WithDialContext supplies the underlying
+		// connection operation; in strict direct mode it is still wrapped by
+		// the IP-policy dialer, which resolves once and passes the validated
+		// literal address to the caller-provided function.
 		dialCtx := cfg.dialContext
+		staggeredFallback := dialCtx == nil
 		if dialCtx == nil {
 			dialer := &net.Dialer{
 				Timeout:   cfg.dialTimeout,
@@ -239,6 +242,16 @@ func New(opts ...Option) *http.Client {
 				Resolver:  cfg.resolver,
 			}
 			dialCtx = dialer.DialContext
+		}
+
+		// When the transport is direct, bind strict SSRF validation to the
+		// actual dial. This removes the preflight/dial double resolution and
+		// closes the DNS-rebinding window between them. A proxy resolves the
+		// target outside this process, and a redirect-specific private-address
+		// exception cannot be expressed at connection scope, so those clients
+		// retain request-time preflight instead.
+		if cfg.strictSSRFInitial && cfg.disableProxy && !cfg.allowPrivateRedirects {
+			dialCtx = newIPPolicyDialContext(cfg.resolver, dialCtx, staggeredFallback)
 		}
 
 		proxyFn := http.ProxyFromEnvironment
@@ -281,6 +294,11 @@ func New(opts ...Option) *http.Client {
 		base = tr
 	}
 
+	// Only a jttp-owned, direct transport can guarantee that the address
+	// validated by the IP policy is the address actually dialed. Custom
+	// transports and proxies retain the existing request-time checks.
+	ipPolicyAtDial := cfg.strictSSRFInitial && cfg.transport == nil && cfg.disableProxy && !cfg.allowPrivateRedirects
+
 	// Construct the redirect guard first — the safety transport needs a pointer
 	// to it for strict-SSRF checks on the initial URL.
 	rGuard := newRedirectGuard(redirectConfig{
@@ -290,6 +308,7 @@ func New(opts ...Option) *http.Client {
 		strictInitial:    cfg.strictSSRFInitial,
 		sensitiveHeaders: cfg.sensitiveHeaders,
 		resolver:         cfg.resolver,
+		ipPolicyAtDial:   ipPolicyAtDial,
 	})
 
 	// safetyTransport sits between retry and the base transport.
@@ -303,7 +322,7 @@ func New(opts ...Option) *http.Client {
 			minRateWindow:      cfg.minRateWindow,
 			maxRatio:           cfg.maxCompressionRatio,
 			bodyObserver:       cfg.bodyObserver,
-			strictSSRFInitial:  cfg.strictSSRFInitial,
+			strictSSRFInitial:  cfg.strictSSRFInitial && !ipPolicyAtDial,
 			redirectGuard:      rGuard,
 		},
 	}
@@ -613,13 +632,19 @@ func WithResolver(r *net.Resolver) Option {
 // proxy support entirely.
 // This option is ignored when WithTransport is used.
 func WithProxy(fn func(*http.Request) (*url.URL, error)) Option {
-	return func(c *config) { c.proxy = fn }
+	return func(c *config) {
+		c.proxy = fn
+		c.disableProxy = false
+	}
 }
 
 // WithNoProxy disables proxy support, making all connections direct.
 // This option is ignored when WithTransport is used.
 func WithNoProxy() Option {
-	return WithProxy(func(*http.Request) (*url.URL, error) { return nil, nil })
+	return func(c *config) {
+		c.proxy = func(*http.Request) (*url.URL, error) { return nil, nil }
+		c.disableProxy = true
+	}
 }
 
 // WithMaxResponseHeaderBytes sets the maximum number of response bytes that
@@ -674,6 +699,14 @@ func WithAllowPrivateRedirects() Option {
 // WithStrictSSRFProtection also applies the IP policy to the initial
 // request URL (not just redirects). Useful for services accepting
 // attacker-controlled URLs.
+//
+// Combine this with [WithNoProxy] to bind validation to the actual network
+// connection: jttp resolves each hostname once per new connection, validates
+// every returned address, and dials an approved literal address. With a proxy
+// or custom transport, jttp cannot control the target dial and therefore
+// retains request-time DNS preflight checks instead. The preflight path is
+// also retained with [WithAllowPrivateRedirects], whose redirect-specific
+// exception cannot be represented safely by a connection-wide dial policy.
 func WithStrictSSRFProtection() Option {
 	return func(c *config) { c.strictSSRFInitial = true }
 }
