@@ -604,8 +604,18 @@ func WithDialKeepAlive(d time.Duration) Option {
 }
 
 // WithDialContext provides a custom function for establishing TCP connections.
-// When set, WithDialTimeout, WithDialKeepAlive, and WithResolver are ignored
-// since they configure the default dialer that this replaces.
+// When set, WithDialTimeout and WithDialKeepAlive are ignored since they
+// configure the default dialer that this replaces.
+//
+// WithResolver is likewise ignored in the general case, but not in strict
+// direct mode: when WithStrictSSRFProtection and WithNoProxy are set without
+// WithAllowPrivateRedirects, jttp resolves the request hostname itself with the
+// configured resolver, validates the full answer set, and calls this function
+// only with an already-validated literal IP address. In that mode WithResolver
+// controls the validation lookup, and a custom dialer that performs its own
+// name resolution never receives the original hostname. This is required to
+// close the DNS-rebinding window between validation and dial.
+//
 // This option is ignored when WithTransport is used.
 func WithDialContext(fn func(ctx context.Context, network, address string) (net.Conn, error)) Option {
 	return func(c *config) { c.dialContext = fn }
@@ -622,7 +632,11 @@ func WithDialContext(fn func(ctx context.Context, network, address string) (net.
 //	    },
 //	}))
 //
-// This option is ignored when WithDialContext or WithTransport is used.
+// This option is ignored when WithTransport is used, and when WithDialContext
+// is used outside strict direct mode. In strict direct mode
+// (WithStrictSSRFProtection and WithNoProxy without WithAllowPrivateRedirects)
+// it drives the validation lookup even alongside WithDialContext; see
+// WithDialContext for details.
 func WithResolver(r *net.Resolver) Option {
 	return func(c *config) { c.resolver = r }
 }
