@@ -56,6 +56,6 @@ var (
 
 	// ErrBlockedByIPPolicy is returned when a redirect target's resolved IP
 	// falls within one of the default-blocked ranges (private, loopback,
-	// link-local, multicast, unique-local v6, or IMDS addresses).
+	// link-local, multicast, unique-local v6, CGNAT, NAT64, or IMDS addresses).
 	ErrBlockedByIPPolicy = errors.New("jttp: target resolves to blocked IP range")
 )

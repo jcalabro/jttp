@@ -10,7 +10,7 @@
 //   - Idle timeout on request-body writes and response-body reads (30s)
 //   - Decompression-bomb guard (1000:1 ratio)
 //   - Redirect loop detection, scheme-downgrade refusal, SSRF filter on
-//     private / loopback / link-local / IMDS addresses
+//     private / loopback / link-local / CGNAT / NAT64 / IMDS addresses
 //
 // All defaults can be overridden via Option values. See the With* options
 // below.
@@ -705,7 +705,8 @@ func WithAllowSchemeDowngrade() Option {
 }
 
 // WithAllowPrivateRedirects opts out of the SSRF redirect guard.
-// When set, redirects to loopback / private / link-local / IMDS addresses are allowed.
+// When set, redirects to loopback / private / link-local / CGNAT / NAT64 / IMDS
+// addresses are allowed.
 func WithAllowPrivateRedirects() Option {
 	return func(c *config) { c.allowPrivateRedirects = true }
 }

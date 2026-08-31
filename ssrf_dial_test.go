@@ -233,3 +233,28 @@ func TestIPPolicyDialLiteralPrivateAddressBlocked(t *testing.T) {
 		t.Fatal("dial called for private literal")
 	}
 }
+
+func TestIPPolicyDialLiteralCGNATAndNAT64Blocked(t *testing.T) {
+	addresses := []string{
+		"100.64.0.1",
+		"100.127.255.255",
+		"64:ff9b::1.2.3.4",
+		"64:ff9b:1::1.2.3.4",
+	}
+	for _, address := range addresses {
+		t.Run(address, func(t *testing.T) {
+			var dialed atomic.Bool
+			dial := newIPPolicyDialContext(nil, func(context.Context, string, string) (net.Conn, error) {
+				dialed.Store(true)
+				return nil, errors.New("unexpected dial")
+			}, true)
+			_, err := dial(t.Context(), "tcp", net.JoinHostPort(address, "443"))
+			if !errors.Is(err, ErrBlockedByIPPolicy) {
+				t.Fatalf("err = %v, want ErrBlockedByIPPolicy", err)
+			}
+			if dialed.Load() {
+				t.Fatal("dial called for blocked address literal")
+			}
+		})
+	}
+}

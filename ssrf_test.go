@@ -33,6 +33,13 @@ func TestIsBlockedIP(t *testing.T) {
 		{"v4 just below 172.16", "172.15.255.255", false},
 		{"v4 just above 172.31", "172.32.0.0", false},
 
+		// RFC 6598 CGNAT (used by overlay networks such as Tailscale)
+		{"v4 just below CGNAT", "100.63.255.255", false},
+		{"v4 CGNAT low", "100.64.0.0", true},
+		{"v4 CGNAT", "100.100.100.100", true},
+		{"v4 CGNAT high", "100.127.255.255", true},
+		{"v4 just above CGNAT", "100.128.0.0", false},
+
 		// ULA v6 (includes IMDS v6)
 		{"v6 ULA fc00", "fc00::1", true},
 		{"v6 ULA fd00", "fd00::1", true},
@@ -53,6 +60,20 @@ func TestIsBlockedIP(t *testing.T) {
 
 		// deprecated site-local fec0::/10 — NOT blocked (deprecated, treat as public)
 		{"v6 site-local (deprecated)", "fec0::1", false},
+
+		// RFC 6052 well-known NAT64
+		{"v6 NAT64 just below prefix", "64:ff9a:ffff::", false},
+		{"v6 NAT64 prefix", "64:ff9b::", true},
+		{"v6 NAT64 embedded IPv4", "64:ff9b::1.2.3.4", true},
+		{"v6 NAT64 prefix high", "64:ff9b::ffff:ffff", true},
+		{"v6 NAT64 just above prefix", "64:ff9b:0:0:0:1::", false},
+
+		// RFC 8215 local-use NAT64
+		{"v6 local NAT64 just below prefix", "64:ff9b:0:ffff::", false},
+		{"v6 local NAT64 prefix", "64:ff9b:1::", true},
+		{"v6 local NAT64 embedded IPv4", "64:ff9b:1::1.2.3.4", true},
+		{"v6 local NAT64 high", "64:ff9b:1:ffff:ffff:ffff:ffff:ffff", true},
+		{"v6 local NAT64 just above prefix", "64:ff9b:2::", false},
 
 		// public
 		{"v4 public cloudflare", "1.1.1.1", false},

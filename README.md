@@ -17,7 +17,7 @@ connection pooling, retry logic, and safety guards built in.
 - Decompression-bomb guard (1000:1 ratio default)
 - Response-body size cap (opt-in)
 - Redirect loop detection, scheme-downgrade refusal
-- SSRF filter on redirects (loopback / private / link-local / IMDS)
+- SSRF filter on redirects (loopback / private / CGNAT / NAT64 / link-local / IMDS)
 - Sensitive-header scrubbing on cross-origin redirects
 - Typed error sentinels; every failure mode has an `errors.Is` target
 

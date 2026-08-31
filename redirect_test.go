@@ -257,7 +257,7 @@ func TestSameOriginHelper(t *testing.T) {
 		same bool
 	}{
 		{"http://x/", "http://x/", true},
-		{"http://x/", "http://X/", true}, // host case-insensitive
+		{"http://x/", "http://X/", true},     // host case-insensitive
 		{"http://x:80/", "http://x/", false}, // port-literal mismatch at this helper level
 		{"http://x/", "https://x/", false},
 		{"http://x:8080/", "http://x:8081/", false},

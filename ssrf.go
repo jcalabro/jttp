@@ -1,6 +1,7 @@
 package jttp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -9,6 +10,11 @@ import (
 )
 
 const ipPolicyFallbackDelay = 250 * time.Millisecond
+
+var (
+	wellKnownNAT64Prefix = [12]byte{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0}
+	localNAT64Prefix     = [6]byte{0x00, 0x64, 0xff, 0x9b, 0, 0x01}
+)
 
 type dialContextFunc func(context.Context, string, string) (net.Conn, error)
 
@@ -177,7 +183,8 @@ func dialApprovedAddresses(ctx context.Context, network string, addresses []stri
 
 // isBlockedIP reports whether ip falls into one of the default-blocked ranges:
 // loopback, link-local unicast, private (including IPv6 ULA), multicast,
-// unspecified ("this network"), or broadcast.
+// unspecified ("this network"), broadcast, RFC 6598 CGNAT, RFC 6052
+// well-known NAT64, or RFC 8215 local-use NAT64.
 //
 // Nil / invalid input is treated as blocked — we fail closed.
 //
@@ -210,6 +217,20 @@ func isBlockedIP(ip net.IP) bool {
 		}
 		// Limited broadcast.
 		if ip4[0] == 255 && ip4[1] == 255 && ip4[2] == 255 && ip4[3] == 255 {
+			return true
+		}
+		// RFC 6598 carrier-grade NAT. Overlay networks commonly use this
+		// range, including Tailscale.
+		if ip4[0] == 100 && ip4[1] >= 64 && ip4[1] <= 127 {
+			return true
+		}
+	} else if ip16 := ip.To16(); ip16 != nil {
+		// RFC 6052 well-known NAT64.
+		if bytes.Equal(ip16[:12], wellKnownNAT64Prefix[:]) {
+			return true
+		}
+		// RFC 8215 local-use NAT64.
+		if bytes.Equal(ip16[:6], localNAT64Prefix[:]) {
 			return true
 		}
 	}

@@ -336,4 +336,3 @@ func TestIntegrationWriteIdleRetriesWithBodyRewind(t *testing.T) {
 		t.Errorf("elapsed %v too long", elapsed)
 	}
 }
-
