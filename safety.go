@@ -1,4 +1,4 @@
-package jttp
+package gttp
 
 import (
 	"context"
@@ -122,7 +122,7 @@ func (t *safetyTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 		if cancel != nil {
 			cancel(nil)
 		}
-		return nil, fmt.Errorf("jttp: wrap response body: %w", gerr)
+		return nil, fmt.Errorf("gttp: wrap response body: %w", gerr)
 	}
 	resp.Body = gb
 	return resp, nil

@@ -1,4 +1,4 @@
-module github.com/jcalabro/jttp
+module github.com/bluesky-social/gttp
 
 go 1.26
 

@@ -1,4 +1,4 @@
-package jttp
+package gttp
 
 import (
 	"context"
@@ -135,7 +135,7 @@ func newGuardedBody(inner io.ReadCloser, cfg guardedBodyConfig) (*guardedBody, e
 		g.compressed = &countingReader{r: inner}
 		gz, err := gzip.NewReader(g.compressed)
 		if err != nil {
-			return nil, fmt.Errorf("jttp: gzip.NewReader: %w", err)
+			return nil, fmt.Errorf("gttp: gzip.NewReader: %w", err)
 		}
 		g.gz = gz
 	}
@@ -213,7 +213,7 @@ func (g *guardedBody) Close() error {
 }
 
 // ctxErr returns the context's cancellation cause if the context is done,
-// otherwise nil. If the cause is a jttp sentinel it is returned unwrapped so
+// otherwise nil. If the cause is a gttp sentinel it is returned unwrapped so
 // errors.Is works naturally at the call site.
 func (g *guardedBody) ctxErr() error {
 	if g.cfg.ctx == nil {

@@ -1,4 +1,4 @@
-// Package jttp provides a robust HTTP client with reasonable defaults and
+// Package gttp provides a robust HTTP client with reasonable defaults and
 // tunable behavior.
 //
 // The returned *http.Client is fully standard — callers use client.Do,
@@ -17,17 +17,17 @@
 //
 // Basic usage:
 //
-//	client := jttp.New() // be sure to reuse this single object across multiple requests!
+//	client := gttp.New() // be sure to reuse this single object across multiple requests!
 //	resp, err := client.Get("https://example.com")
 //
 // With options:
 //
-//	client := jttp.New(
-//	    jttp.WithTimeout(10 * time.Second),
-//	    jttp.WithRetries(5),
-//	    jttp.WithAdditionalRetryableStatusCodes(500),
+//	client := gttp.New(
+//	    gttp.WithTimeout(10 * time.Second),
+//	    gttp.WithRetries(5),
+//	    gttp.WithAdditionalRetryableStatusCodes(500),
 //	)
-package jttp
+package gttp
 
 import (
 	"context"
@@ -288,13 +288,13 @@ func New(opts ...Option) *http.Client {
 			var err error
 			h2, err = configureHTTP2(tr, cfg.http2ReadIdleTimeout, cfg.http2PingTimeout)
 			if err != nil {
-				panic(fmt.Sprintf("jttp: unexpected error configuring HTTP/2: %v", err))
+				panic(fmt.Sprintf("gttp: unexpected error configuring HTTP/2: %v", err))
 			}
 		}
 		base = tr
 	}
 
-	// Only a jttp-owned, direct transport can guarantee that the address
+	// Only a gttp-owned, direct transport can guarantee that the address
 	// validated by the IP policy is the address actually dialed. Custom
 	// transports and proxies retain the existing request-time checks.
 	ipPolicyAtDial := cfg.strictSSRFInitial && cfg.transport == nil && cfg.disableProxy && !cfg.allowPrivateRedirects
@@ -458,7 +458,7 @@ func WithRetryableStatusCodes(codes ...int) Option {
 // WithAdditionalRetryableStatusCodes adds status codes to the default retryable set
 // without replacing it. For example, to also retry on 500:
 //
-//	jttp.New(jttp.WithAdditionalRetryableStatusCodes(500))
+//	gttp.New(gttp.WithAdditionalRetryableStatusCodes(500))
 func WithAdditionalRetryableStatusCodes(codes ...int) Option {
 	return func(c *config) {
 		for _, code := range codes {
@@ -481,7 +481,7 @@ func WithRetryableMethods(methods ...string) Option {
 // WithAdditionalRetryableMethods adds HTTP methods to the default retryable set
 // without replacing it. For example, to also retry POST and PUT:
 //
-//	jttp.New(jttp.WithAdditionalRetryableMethods("POST", "PUT"))
+//	gttp.New(gttp.WithAdditionalRetryableMethods("POST", "PUT"))
 func WithAdditionalRetryableMethods(methods ...string) Option {
 	return func(c *config) {
 		for _, m := range methods {
@@ -530,11 +530,11 @@ func WithRetryObserver(fn func(attempt int, req *http.Request, resp *http.Respon
 // timeout, size cap, min-rate) are still applied on top, but note:
 //
 // The decompression-bomb guard (WithMaxCompressionRatio) is effectively
-// disabled when a custom transport is supplied, because jttp can no longer
+// disabled when a custom transport is supplied, because gttp can no longer
 // control the base transport's DisableCompression setting. The caller's
 // transport is presumed to handle Accept-Encoding / gzip decoding itself,
 // and once stdlib's default transport auto-decodes, the response arrives
-// without a Content-Encoding header for jttp to act on. If you need the
+// without a Content-Encoding header for gttp to act on. If you need the
 // bomb guard, use the default transport.
 func WithTransport(rt http.RoundTripper) Option {
 	return func(c *config) { c.transport = rt }
@@ -609,7 +609,7 @@ func WithDialKeepAlive(d time.Duration) Option {
 //
 // WithResolver is likewise ignored in the general case, but not in strict
 // direct mode: when WithStrictSSRFProtection and WithNoProxy are set without
-// WithAllowPrivateRedirects, jttp resolves the request hostname itself with the
+// WithAllowPrivateRedirects, gttp resolves the request hostname itself with the
 // configured resolver, validates the full answer set, and calls this function
 // only with an already-validated literal IP address. In that mode WithResolver
 // controls the validation lookup, and a custom dialer that performs its own
@@ -625,7 +625,7 @@ func WithDialContext(fn func(ctx context.Context, network, address string) (net.
 // This is useful for directing DNS queries to a specific server (e.g., 1.1.1.1)
 // without replacing the entire dial function. Example:
 //
-//	jttp.New(jttp.WithResolver(&net.Resolver{
+//	gttp.New(gttp.WithResolver(&net.Resolver{
 //	    PreferGo: true,
 //	    Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
 //	        return (&net.Dialer{}).DialContext(ctx, "udp", "1.1.1.1:53")
@@ -716,9 +716,9 @@ func WithAllowPrivateRedirects() Option {
 // attacker-controlled URLs.
 //
 // Combine this with [WithNoProxy] to bind validation to the actual network
-// connection: jttp resolves each hostname once per new connection, validates
+// connection: gttp resolves each hostname once per new connection, validates
 // every returned address, and dials an approved literal address. With a proxy
-// or custom transport, jttp cannot control the target dial and therefore
+// or custom transport, gttp cannot control the target dial and therefore
 // retains request-time DNS preflight checks instead. The preflight path is
 // also retained with [WithAllowPrivateRedirects], whose redirect-specific
 // exception cannot be represented safely by a connection-wide dial policy.

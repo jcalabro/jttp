@@ -1,11 +1,11 @@
-# jttp
+# gttp
 
-[![ci](https://github.com/jcalabro/jttp/actions/workflows/ci.yaml/badge.svg)](https://github.com/jcalabro/jttp/actions/workflows/ci.yaml)
-[![Go Reference](https://pkg.go.dev/badge/github.com/jcalabro/jttp.svg)](https://pkg.go.dev/github.com/jcalabro/jttp)
+[![ci](https://github.com/bluesky-social/gttp/actions/workflows/ci.yaml/badge.svg)](https://github.com/bluesky-social/gttp/actions/workflows/ci.yaml)
+[![Go Reference](https://pkg.go.dev/badge/github.com/bluesky-social/gttp.svg)](https://pkg.go.dev/github.com/bluesky-social/gttp)
 
-A robust HTTP client for Go with good defaults and tunable behavior.
+A robust HTTP client for Go with good defaults and tunable behavior. Called `gttp` because it's a "go http" client library.
 
-`jttp.New()` returns a standard `*http.Client` with sensible timeouts,
+`gttp.New()` returns a standard `*http.Client` with sensible timeouts,
 connection pooling, retry logic, and safety guards built in.
 
 ## Features
@@ -25,17 +25,17 @@ connection pooling, retry logic, and safety guards built in.
 
 ```go
 // Use the defaults:
-client := jttp.New()
+client := gttp.New()
 resp, err := client.Get("https://example.com")
 
 // Tune for your environment:
-client := jttp.New(
-    jttp.WithTimeout(10 * time.Second),
-    jttp.WithRetries(5),
-    jttp.WithIdleTimeout(10 * time.Second),
-    jttp.WithMaxResponseBodyBytes(100 << 20),
-    jttp.WithStrictSSRFProtection(),
+client := gttp.New(
+    gttp.WithTimeout(10 * time.Second),
+    gttp.WithRetries(5),
+    gttp.WithIdleTimeout(10 * time.Second),
+    gttp.WithMaxResponseBodyBytes(100 << 20),
+    gttp.WithStrictSSRFProtection(),
 )
 ```
 
-See [godoc](https://pkg.go.dev/github.com/jcalabro/jttp) for the full option list.
+See [godoc](https://pkg.go.dev/github.com/bluesky-social/gttp) for the full option list.

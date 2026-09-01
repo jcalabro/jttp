@@ -1,4 +1,4 @@
-package jttp
+package gttp
 
 import (
 	"net/http"
@@ -49,7 +49,7 @@ func requireFalse(t testing.TB, v bool) {
 	}
 }
 
-// innerHTTPTransport unwraps the jttp transport chain
+// innerHTTPTransport unwraps the gttp transport chain
 // (retryTransport -> safetyTransport -> *http.Transport) to the underlying
 // *http.Transport. Fatals the test if any layer has the wrong type.
 func innerHTTPTransport(t testing.TB, rt *retryTransport) *http.Transport {

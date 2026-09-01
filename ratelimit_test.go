@@ -1,4 +1,4 @@
-package jttp
+package gttp
 
 import (
 	"fmt"

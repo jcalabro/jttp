@@ -1,4 +1,4 @@
-package jttp
+package gttp
 
 import (
 	"context"
@@ -104,6 +104,27 @@ func TestTier1SentinelsDefined(t *testing.T) {
 		}
 		if err.Error() == "" {
 			t.Errorf("sentinel has empty message: %v", err)
+		}
+	}
+}
+
+func TestSentinelErrorPrefix(t *testing.T) {
+	for _, err := range []error{
+		ErrBodyTooLarge,
+		ErrBodyRead,
+		ErrBodyClose,
+		ErrBodyRewind,
+		ErrTooManyRedirects,
+		ErrBodyIdleTimeout,
+		ErrBodyTransferTooSlow,
+		ErrResponseTooLarge,
+		ErrDecompressionBomb,
+		ErrRedirectLoop,
+		ErrSchemeDowngrade,
+		ErrBlockedByIPPolicy,
+	} {
+		if !strings.HasPrefix(err.Error(), "gttp: ") {
+			t.Errorf("sentinel error %q does not have gttp prefix", err)
 		}
 	}
 }

@@ -1,4 +1,4 @@
-package jttp
+package gttp
 
 import (
 	"bytes"
@@ -30,7 +30,7 @@ func newIPPolicyDialContext(resolver ipLookuper, dial dialContextFunc, staggered
 	return func(ctx context.Context, network, address string) (net.Conn, error) {
 		host, port, err := net.SplitHostPort(address)
 		if err != nil {
-			return nil, fmt.Errorf("jttp: parse dial address %q: %w", address, err)
+			return nil, fmt.Errorf("gttp: parse dial address %q: %w", address, err)
 		}
 
 		if ip := net.ParseIP(host); ip != nil {
@@ -59,7 +59,7 @@ func newIPPolicyDialContext(resolver ipLookuper, dial dialContextFunc, staggered
 			addresses = append(addresses, net.JoinHostPort(ipa.String(), port))
 		}
 		if len(addresses) == 0 {
-			return nil, fmt.Errorf("jttp: resolve %s: no addresses for network %s", host, network)
+			return nil, fmt.Errorf("gttp: resolve %s: no addresses for network %s", host, network)
 		}
 
 		var conn net.Conn
@@ -69,14 +69,14 @@ func newIPPolicyDialContext(resolver ipLookuper, dial dialContextFunc, staggered
 			conn, err = dialApprovedAddressesSequentially(ctx, network, addresses, dial)
 		}
 		if err != nil {
-			return nil, fmt.Errorf("jttp: dial %s: %w", host, err)
+			return nil, fmt.Errorf("gttp: dial %s: %w", host, err)
 		}
 		return conn, nil
 	}
 }
 
 // dialApprovedAddressesSequentially avoids imposing concurrency on a
-// caller-supplied dial function, whose cancellation behavior jttp cannot
+// caller-supplied dial function, whose cancellation behavior gttp cannot
 // enforce. The built-in net.Dialer path uses staggered fallback below.
 func dialApprovedAddressesSequentially(ctx context.Context, network string, addresses []string, dial dialContextFunc) (net.Conn, error) {
 	var errs []error
